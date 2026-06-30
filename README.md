@@ -15,7 +15,7 @@ Diffusion 2 + ControlNet** for multi-weather image restoration
 * **SD2 base + ControlNet** restoration pipeline via HuggingFace `diffusers`.
 * **Weather-class conditioning** controlled by a single YAML switch
   (`weather_prompt.use_weather_prompt`). When enabled, the weather type
-  (rain / snow / fog) is prepended to the SD2 text prompt so the model
+  (rain / snow / haze) is prepended to the SD2 text prompt so the model
   knows *which* degradation it is removing.
 * **Single unified config file** (`config/config.yaml`) — every path,
   weight, weather class and hyper-parameter lives there. Startup only
@@ -98,6 +98,34 @@ dataset:
   gt_subdir:    "GT"
 ```
 
+### Windows paths
+
+If you are on Windows, **do NOT use double-quoted backslashes** —
+YAML interprets `\P`, `\W` etc. as (unknown) escape sequences and the
+parser will fail.  Pick one of these instead:
+
+```yaml
+# 1. Single-quoted  (recommended)
+dataset:
+  data_root: 'D:\Projects\pycharm\WeaFU-main\dataprocess'
+
+# 2. Forward slashes  (also fine, Python handles both)
+dataset:
+  data_root: D:/Projects/pycharm/WeaFU-main/dataprocess
+
+# 3. Unquoted
+dataset:
+  data_root: D:\Projects\pycharm\WeaFU-main\dataprocess
+```
+
+Avoid:
+
+```yaml
+# ❌ This will raise a YAML ScannerError ("found unknown escape character 'p'")
+dataset:
+  data_root: "D:\Projects\pycharm\WeaFU-main\dataprocess"
+```
+
 Expected layout (weather-first, no separate validation set):
 
 ```
@@ -136,7 +164,7 @@ weather_prompt:
   weather_tokens:
     rain: "rain"
     snow: "snow"
-    haze: "fog"                       # "haze" folder is described as "fog"
+    haze: "haze"
   cfg_dropout_prob: 0.1
   empty_prompt: ""
 ```
@@ -149,7 +177,7 @@ and threaded through the training pipeline as follows:
 | 1 | `datasets/weather_restoration.py:160` | The dataset returns a `weather` string per item (the parent folder name, e.g. `"rain"`). |
 | 2 | `train.py:347-352` | The trainer passes `batch["weather"]` (a list of labels for the batch) into `model.prepare_batch(...)`. |
 | 3 | `models/controlnet_wrapper.py:213` | `prepare_batch` calls `self.weather_prompt_encoder.build_prompts(weather_labels, generator=...)`. |
-| 4 | `models/weather_conditioning.py:73-101` | For each label the encoder looks up `weather_tokens[label]` (e.g. `haze → "fog"`), substitutes it into `prompt_template` (e.g. `"a clean photo after removing fog, ..."`), and optionally drops the prompt to `empty_prompt` with probability `cfg_dropout_prob` for classifier-free guidance. |
+| 4 | `models/weather_conditioning.py:73-101` | For each label the encoder looks up `weather_tokens[label]` (e.g. `haze → "haze"`), substitutes it into `prompt_template` (e.g. `"a clean photo after removing haze, ..."`), and optionally drops the prompt to `empty_prompt` with probability `cfg_dropout_prob` for classifier-free guidance. |
 | 5 | `models/controlnet_wrapper.py:214` | The resulting prompts are tokenised by the frozen SD2 text encoder to produce `prompt_embeds`. |
 | 6 | `models/controlnet_wrapper.py:241-256` | `prompt_embeds` are fed to **both** the ControlNet (`encoder_hidden_states`) and the SD2 UNet. |
 
@@ -161,7 +189,7 @@ text conditioning that drives SD2.
 
 * `use_weather_prompt: true`  → each prompt becomes e.g.
   `"a clean photo after removing rain, high quality, sharp"`, so the model
-  distinguishes rain / snow / fog.
+  distinguishes rain / snow / haze.
 * `use_weather_prompt: false` → every prompt becomes the empty string in
   `empty_prompt`; the weather-class signal is removed entirely (useful
   for ablations).
@@ -199,5 +227,229 @@ name) or from `infer.weather` as a fallback.
   constrained (256 / 384 / 512 are all supported).
 * `weather_prompt.cfg_dropout_prob` provides the unconditional branch for
   classifier-free guidance — set to `0.0` to disable.
+
+### What does `steps=N` mean?
+
+The training loop logs `steps=N` at startup — this is the **total number
+of optimization steps** (one gradient update each), **NOT** the diffusion
+timesteps.  Concretely:
+
+```
+total_steps = ceil(N_samples / batch_size / gradient_accumulation_steps)
+            × num_train_epochs
+```
+
+Each step does **one** forward+backward pass through ControlNet + SD2 UNet
+and samples **one** random diffusion timestep (out of the 1000-step DDPM
+schedule) for noise prediction.  So if your dataset has 18 252 images and
+you train for 20 epochs at `batch_size=4`, expect `20 × 4563 = 91 260`
+total steps.
+
+To shrink training time, adjust in the YAML:
+
+| Knob | Effect |
+|------|--------|
+| `train.num_train_epochs` | Total epoch count (default 20). |
+| `train.max_train_steps` | Hard cap on total steps; overrides `num_train_epochs`. |
+| `train.batch_size` | Bigger ⇒ fewer steps per epoch. |
+| `train.gradient_accumulation_steps` | Effectively larger batch without OOM. |
+| `dataset.image_size` | 256 instead of 512 ⇒ ~4× faster per step. |
+
+### Per-step timing and ETA
+
+A single **live `tqdm` progress bar** spans the entire training run and
+updates twice a second with the latest metrics:
+
+```
+train |████████████▌        | 2000/91260 [08:32<30:21, 3.91it/s, loss=0.0842, lr=1.0e-05]
+```
+
+* **Elapsed** / **remaining** time come from tqdm's internal timer.
+* **Rate** (`it/s`) is steps-per-second.
+* **Postfix** (`loss`, `loss_l1`, `lr`, `epoch`) updates every step.
+
+Every `log_every_n_steps` (default 20) a structured log line is also
+written *above* the bar via `tqdm.write()`, so the training record in
+`outputs/<name>/train.log` keeps the same format as before:
+
+```
+step=200/91260 | epoch=0 (200/4563) | loss=0.0842 | loss_l1=0.0000
+            | lr=1.00e-05 | step=0.92s | epoch_eta=1h10m | total_eta=23h22m
+```
+
+To disable the bar (e.g. when piping output to a file in CI), set:
+
+```yaml
+train:
+  show_progress_bar: false
+```
+
+### Per-epoch metrics, checkpointing & best model
+
+At the end of every epoch the loop prints an aggregate metric line **and
+** automatically triggers three bookkeeping actions depending on the
+YAML:
+
+```yaml
+train:
+  # Save a full checkpoint every N epochs (in addition to checkpointing_steps).
+  checkpointing_epochs: 1
+
+  # Continuously overwrite outputs/<name>/best/ with the best-so-far model.
+  # best_metric supports loss-style and image-quality metrics; the
+  # comparison direction (min/max) is auto-inferred from the metric name.
+  save_best: true
+  best_metric: "val_psnr"          # epoch_loss | epoch_loss_l1 | val_psnr | val_ssim
+  best_metric_mode: "max"          # explicit; auto-inferred if null
+
+  # Run the model on N test images at every save point and write
+  # LQ / GT / restored grids to outputs/<name>/preview/.
+  num_preview_images: 4
+
+  # PSNR / SSIM computation (see "Image-quality metrics" below).
+  image_quality:
+    data_range: 1.0
+    backend: "torchmetrics"        # or "pure-torch" (built-in fallback)
+```
+
+End-of-epoch output (printed above the bar):
+
+```
+epoch 0 | avg_loss=0.084231 | avg_loss_l1=0.000123 | val_psnr=22.51dB
+       | val_ssim=0.8214 | steps=4563 | time=1h09m53s (0.92s/step)
+  >> NEW BEST val_psnr = 22.510 (prev=None) @ epoch=0 step=4563
+```
+
+### Output directory layout
+
+Each saved checkpoint is a **directory** (HuggingFace's standard format,
+not a single file):
+
+```
+outputs/<name>/
+├── checkpoint-<step>/                  # step-based (every checkpointing_steps)
+│   ├── diffusion_pytorch_model.safetensors   ← the actual ControlNet weights (~1.4 GB)
+│   ├── config.json                          <!-- config.json -->
+│   ├── optimizer.pt                         ← Adam momentum/variance state
+│   └── scheduler.pt                         ← LR scheduler state
+├── checkpoint-epoch-<N>/               # epoch-based (every checkpointing_epochs)
+│   └── (same 4 files as above)
+├── best/                               # continuously overwritten with the best model
+│   ├── diffusion_pytorch_model.safetensors
+│   ├── config.json
+│   ├── optimizer.pt
+│   └── scheduler.pt
+├── preview/
+│   ├── step-004563.png                 # LQ / GT / restored triplet
+│   ├── epoch-000.png
+│   ├── best.png                        # current-best preview
+│   └── final.png
+├── validation/
+│   └── step-000500.png                 # periodic validation grid
+└── train.log                           # all INFO logs
+```
+
+For inference, point `infer.ckpt_path` at the **directory**, not at a
+single `.safetensors` file:
+
+```yaml
+infer:
+  ckpt_path: "./outputs/<name>/best"            # canonical "best so far"
+  # or:
+  # ckpt_path: "./outputs/<name>/checkpoint-700"
+  # ckpt_path: "./outputs/<name>/checkpoint-epoch-0"
+```
+
+After every save the trainer logs the exact file list it wrote:
+
+```
+INFO | train | Saved checkpoint to ./outputs/controlnet_multi_weather/checkpoint-700
+       (files: config.json, diffusion_pytorch_model.safetensors, optimizer.pt, scheduler.pt)
+```
+
+### Full-image inference (no crop) & resolution restoration
+
+During training, images are center-cropped to `dataset.image_size` (e.g.,
+512x512) to match square training patches.
+
+However, during **inference** (one-shot restoration via `main.py --mode infer`),
+cropping is highly undesirable because it would throw away the borders of
+your test images.  We implement **full-image warp inference**:
+
+1. **Pre-processing**: The entire `orig_w × orig_h` image is warped directly
+   to a square tensor of `image_size × image_size` (`crop=False`, no border
+   loss).
+2. **Inference**: ControlNet + SD UNet restore the warped square image.
+3. **Post-processing**: The restored output is scaled back to the exact
+   original resolution (`orig_w × orig_h`) using bicubic interpolation.
+
+This ensures **the entire test image is restored**, and the output matches
+your input resolution and aspect ratio pixel-for-pixel without distortion.
+
+To toggle this behavior (default is true):
+
+```yaml
+infer:
+  output_to_original_size: true         # set to false to keep outputs as 512x512
+```
+
+### Image-quality metrics (PSNR / SSIM)
+
+Every epoch end (and every `validation_steps` interval) the loop runs the
+full test set through the model and computes **PSNR** and **SSIM** between
+the restored outputs and the ground-truth.  Both metrics are computed
+on the entire test set (not just the first N preview images) and
+written to:
+
+* the terminal log,
+* the per-epoch metric line above,
+* the `outputs/<name>/train.log` file,
+* TensorBoard / wandb under the `val/psnr` and `val/ssim` tags.
+
+Implementation lives in `utils/metrics.py`:
+
+* **Primary backend**: [`torchmetrics`](https://lightning.ai/docs/torchmetrics/stable/)
+  (the canonical PyTorch-native metric library, recommended).
+* **Fallback**: a pure-torch implementation that needs no extra deps —
+  used automatically when `torchmetrics` is not installed.
+
+To pick which backend to use (or fall back to pure-torch manually):
+
+```yaml
+train:
+  image_quality:
+    backend: "torchmetrics"   # or "pure-torch"
+```
+
+Use PSNR / SSIM as the best-model metric:
+
+```yaml
+train:
+  best_metric: "val_psnr"     # track peak signal-to-noise ratio
+  best_metric_mode: "max"     # higher is better (auto-inferred if omitted)
+```
+
+`val_psnr` / `val_ssim` keep overwriting `outputs/<name>/best/` whenever
+the metric improves, so the `best/` snapshot is always the checkpoint
+that gave the cleanest restoration.
+
+Output layout under `outputs/<name>/`:
+
+```
+checkpoint-<step>/      # every checkpointing_steps
+checkpoint-epoch-<N>/   # every checkpointing_epochs
+best/                   # best model so far (overwritten on improvement)
+preview/step-004563.png # LQ / GT / restored triplet for that step
+preview/epoch-000.png   # LQ / GT / restored triplet for that epoch
+preview/best.png        # LQ / GT / restored triplet for the current best
+validation/step-*.png   # periodic validation grids (legacy, kept)
+train.log               # all INFO logs
+```
+
+The preview grids are the easiest way to eyeball restoration quality:
+each PNG stacks the same `num_preview_images` test samples vertically as
+`LQ / GT / restored`. Compare `preview/best.png` against the most recent
+`preview/step-XXXXXX.png` to see whether the latest checkpoint actually
+beats the running best.
 
 Happy restoring! 🌤️🌧️❄️🌫️

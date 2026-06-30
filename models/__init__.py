@@ -3,7 +3,7 @@
 Exposes two building blocks:
 
 * :class:`WeatherPromptEncoder`  – builds text prompts conditioned on the
-  current weather class (rain / snow / fog) and applies classifier-free
+  current weather class (rain / snow / haze) and applies classifier-free
   guidance dropout.
 * :class:`ControlNetRestorationModel` – wraps a frozen SD2 UNet + VAE +
   text-encoder together with a trainable ControlNet used to inject the

@@ -22,21 +22,36 @@ project:
   num_gpus: 1                         # for logging only; torchrun can override
   mixed_precision: "fp16"             # "no" | "fp16" | "bf16"
   enable_xformers: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   print_config_on_start: true
 
 # -----------------------------------------------------------------------------
 # Model
 # -----------------------------------------------------------------------------
+# NOTE: ``base_model_path`` and ``controlnet_path`` are coupled — the
+# ControlNet weights must match the UNet architecture they were trained
+# against.  The default pairing below uses SD 2 base + a SD2.1-base
+# canny ControlNet (architecturally compatible with SD 2 base):
+#
+#     base_model_path  = stabilityai/stable-diffusion-2-base
+#     controlnet_path  = thibaud/controlnet-sd21-canny
+#
+# If you ever switch to SD 1.5, swap both:
+#     base_model_path  = runwayml/stable-diffusion-v1-5
+#     controlnet_path  = lllyasviel/sd-controlnet-canny
 model:
-  # SD2 base model (local path or HuggingFace repo id)
-  base_model_path: "stabilityai/stable-diffusion-2-base"
-  # ControlNet checkpoint path:
-  #   - training:   initial weights to resume from (null = random init)
-  #   - inference:  ignored unless infer.ckpt_path is null
-  controlnet_path: null
+  # SD base model (local path or HuggingFace repo id)
+  base_model_path: "sd-research/stable-diffusion-2-base"
+  # ControlNet checkpoint — accepts either a local directory or a HuggingFace
+  # Hub repo id.  Set to ``null`` to fall back to random init
+  # (``ControlNetModel.from_unet(self.unet)``).
+  controlnet_path: "thibaud/controlnet-sd21-canny-diffusers"
   # Conditioning type expected by the loaded ControlNet
   controlnet_hint_type: "degraded"    # "degraded" | "canny" | ...
+  # Range expected by the loaded ControlNet's ``conv_in``.  The canny ckpt
+  # was trained on canny edge maps in [0, 1]; the random-init fallback
+  # and most image-to-image ControlNets expect [-1, 1] (VAE-style).
+  controlnet_hint_range: "zero_one"    # "zero_one" | "minus_one_one"
   image_channels: 3
   latent_channels: 4
   downsample_factor: 8
@@ -46,14 +61,14 @@ model:
 # -----------------------------------------------------------------------------
 weather_prompt:
   # Master switch: if true, prepend a weather-specific phrase to the prompt
-  use_weather_prompt: true
+  use_weather_prompt: false
   prompt_template: "a clean photo after removing {weather}, high quality, sharp"
   negative_prompt: "blurry, low quality, artifacts, noise, distorted"
   # Mapping from dataset folder name -> natural language token
   weather_tokens:
     rain: "rain"
     snow: "snow"
-    haze: "fog"                       # "haze" folder is described as "fog" in prompts
+    haze: "haze"
   # Classifier-free guidance dropout probability
   cfg_dropout_prob: 0.1
   empty_prompt: ""
@@ -81,7 +96,7 @@ weather_prompt:
 # The "test" split is reused for periodic validation during training because
 # the dataset does not provide a separate validation set.
 dataset:
-  data_root: "./data"
+  data_root: 'D:\Projects\pycharm\WeaFU-main\dataprocess'
   train_subdir: "train"
   test_subdir:  "test"
   lq_subdir:    "LQ"
@@ -92,12 +107,17 @@ dataset:
     - ".jpeg"
     - ".bmp"
     - ".webp"
-  image_size: 512
+  image_size: 256
   random_flip: true
   random_crop: true
   normalize_range: "minus_one_one"    # "minus_one_one" | "zero_one"
-  num_workers: 4
+  num_workers: 8
   test_max_samples: 16                # cap on validation-time samples
+  # Optional per-weather-class sample cap.  When set to a positive int,
+  # each weather subfolder (rain / snow / haze / ...) is capped to that
+  # many samples.  Useful for keeping the classes balanced when one
+  # weather has many more images than the others.  null = no cap.
+  samples_per_weather: 500           # e.g. 1000 -> 1000 rain + 1000 snow + 1000 haze
 
 # -----------------------------------------------------------------------------
 # Training hyperparameters
@@ -105,7 +125,7 @@ dataset:
 train:
   num_train_epochs: 20
   max_train_steps: null               # if set, overrides num_train_epochs
-  batch_size: 4
+  batch_size: 8
   gradient_accumulation_steps: 1
 
   learning_rate: 1.0e-5
@@ -120,18 +140,60 @@ train:
   prediction_type: "epsilon"          # "epsilon" | "v_prediction"
   noise_offset: 0.0
 
-  validation_steps: 500
-  checkpointing_steps: 1000
+  validation_steps: 5000
+  checkpointing_steps: 5000          # save every N optimizer steps
+  checkpointing_epochs: 1           # save every N epochs (null = disabled)
   checkpoints_total_limit: 3
   resume_from_checkpoint: null       # path to checkpoint dir, or "latest"
-  num_validation_images: 4
-  guidance_scale: 7.5
-  num_inference_steps: 30
+
+  # ------------------------------------------------------------------
+  # "Best model" tracking
+  # ------------------------------------------------------------------
+  # Continuously overwrite outputs/<name>/best/ whenever the tracked metric
+  # improves.  Useful for picking the checkpoint with the cleanest visual
+  # restoration without manually browsing logs.
+  #
+  # best_metric options:
+  #   "epoch_loss"      -> track average train loss (mode auto = "min")
+  #   "epoch_loss_l1"   -> track average train L1 (mode auto = "min")
+  #   "val_psnr"        -> track validation PSNR (mode auto = "max")
+  #   "val_ssim"        -> track validation SSIM (mode auto = "max")
+  save_best: true
+  best_metric: "val_psnr"          # higher PSNR = cleaner restoration
+  best_metric_mode: "max"          # explicit; auto-inferred if null
+
+  # ------------------------------------------------------------------
+  # Image-quality metrics (PSNR / SSIM)
+  # ------------------------------------------------------------------
+  image_quality:
+    # data_range expected by PSNR/SSIM. SD2 outputs are clamped to [-1, 1]
+    # then renormalised to [0, 1], so 1.0 is the correct value.
+    data_range: 1.0
+    # Backend: "torchmetrics" (preferred, fast) or "pure-torch" (fallback).
+    backend: "torchmetrics"
+
+  # ------------------------------------------------------------------
+  # Visual preview at save time
+  # ------------------------------------------------------------------
+  # At every checkpoint save (step or epoch), the model is run on a few
+  # test images and the LQ / GT / restored triplet is written as a single
+  # PNG so you can eyeball restoration quality over time.
+  num_preview_images: 2              # how many test images to render
+  preview_image_size: 512            # inference size for the preview grid
+
+  num_validation_images: 2           # how many images per validation grid
+  # Restoration uses a much lower CFG than text-to-image (SD default 7.5).
+  # 2.5 is a safe starting point; 1.0 disables CFG entirely.
+  guidance_scale: 2.5
+  num_inference_steps: 5
 
   log_every_n_steps: 20
   report_to: "tensorboard"            # "tensorboard" | "wandb" | "none"
   tracker_project_name: "controlnet-multi-weather"
   dataloader_pin_memory: true
+
+  # Live tqdm progress bar (disable when piping output to a file / CI)
+  show_progress_bar: true
 
 # -----------------------------------------------------------------------------
 # Inference / one-shot restoration
@@ -148,13 +210,27 @@ train:
 #         weather label and also looked up in ``weather_prompt.weather_tokens``.
 #       * Otherwise ``weather`` is applied to every image.
 infer:
-  # ControlNet weights to load.  Falls back to model.controlnet_path when null.
-  ckpt_path: "./outputs/controlnet_multi_weather/checkpoint-1000"
+  # ControlNet checkpoint directory to load.  Each saved checkpoint is
+  # actually a directory (HuggingFace standard format) containing:
+  #   diffusion_pytorch_model.safetensors   <- the actual weights
+  #   config.json                           <- model architecture
+  #   optimizer.pt / scheduler.pt           <- training state (only on training ckpts)
+  # Point ckpt_path at the *directory*, not at a single file.
+  # After training, the safest choice is ``best/`` (continuously overwritten
+  # with the best-so-far model).  Other valid choices:
+  #   ./outputs/<name>/checkpoint-<step>          step-based snapshot
+  #   ./outputs/<name>/checkpoint-epoch-<N>      epoch-based snapshot
+  #   ./outputs/<name>/best                       best-so-far model
+  ckpt_path: "./outputs/controlnet_multi_weather/best"
+
+  # Whether to resize the restored output back to the original image's
+  # resolution and aspect ratio (no border loss).  Recommended true.
+  output_to_original_size: true
 
   # (a) Single image mode
-  input_path: "./demo/rainy.png"
-  output_path: "./demo/rainy_restored.png"
-  weather: "rain"                     # "rain" | "snow" | "haze"
+#  input_path: "./demo/rainy.png"
+#  output_path: "./demo/rainy_restored.png"
+#  weather: "rain"                     # "rain" | "snow" | "haze"
 
   # (b) Batch folder mode (only used when input_path is null)
   input_dir: null                     # e.g. "./demo/batch_in"
@@ -164,6 +240,6 @@ infer:
   # in the batch directory.
 
   # Sampling parameters (override train.* values for inference)
-  guidance_scale: 7.5
+  guidance_scale: 2.5
   num_inference_steps: 30
   image_size: 512                     # resize short side -> center crop to this size

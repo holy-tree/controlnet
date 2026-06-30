@@ -1,6 +1,6 @@
 """Weather-class prompt encoder.
 
-Given a batch of weather labels (``"rain"``, ``"snow"``, ``"fog"`` ...) this
+Given a batch of weather labels (``"rain"``, ``"snow"``, ``"haze"`` ...) this
 module produces the corresponding text prompts that are then tokenised by the
 SD2 text encoder.
 
@@ -42,9 +42,13 @@ class WeatherPromptEncoder:
     prompt_template
         Format string that receives the weather token, e.g.
         ``"a clean photo after removing {weather}, high quality"``.
+    negative_prompt
+        Text fed to the diffusion pipeline's negative branch during
+        inference (classifier-free guidance).  Ignored during training
+        except for the empty/``use_weather_prompt=False`` paths.
     empty_prompt
         Prompt used when ``use_weather_prompt`` is ``False`` or when CFG
-        dropout fires.
+        dropout fires.  Also the default unconditional prompt at inference.
     weather_tokens
         Mapping from dataset folder name (e.g. ``"rain"``) to natural
         language token (e.g. ``"rain"``).
@@ -56,14 +60,16 @@ class WeatherPromptEncoder:
         self,
         use_weather_prompt: bool = True,
         prompt_template: str = "a clean photo after removing {weather}, high quality, sharp",
+        negative_prompt: str = "",
         empty_prompt: str = "",
         weather_tokens: Optional[Dict[str, str]] = None,
         cfg_dropout_prob: float = 0.1,
     ) -> None:
         self.use_weather_prompt = use_weather_prompt
         self.prompt_template = prompt_template
+        self.negative_prompt = negative_prompt
         self.empty_prompt = empty_prompt
-        self.weather_tokens = weather_tokens or {"rain": "rain", "snow": "snow", "fog": "fog"}
+        self.weather_tokens = weather_tokens or {"rain": "rain", "snow": "snow", "haze": "haze"}
         self.cfg_dropout_prob = float(cfg_dropout_prob)
 
     # ------------------------------------------------------------------ #
@@ -80,7 +86,7 @@ class WeatherPromptEncoder:
         ----------
         weather_labels
             Iterable of length ``B`` with weather names (e.g. ``["rain",
-            "snow", "fog", "rain"]``).
+            "snow", "haze", "rain"]``).
         generator
             Optional torch RNG used for the CFG dropout decision.  Falls
             back to the global RNG if not provided.
@@ -109,8 +115,17 @@ class WeatherPromptEncoder:
     # Convenience helpers
     # ------------------------------------------------------------------ #
     def get_unconditional_prompt(self) -> str:
-        """Prompt used during validation-time CFG (negative branch)."""
-        return self.empty_prompt
+        """Prompt used during validation-time CFG (negative branch).
+
+        Returns ``self.negative_prompt`` if non-empty, otherwise falls back
+        to ``self.empty_prompt``.
+        """
+        return self.negative_prompt if self.negative_prompt else self.empty_prompt
+
+    def get_negative_prompt(self) -> str:
+        """Alias for :meth:`get_unconditional_prompt` — clearer name at
+        inference call-sites."""
+        return self.get_unconditional_prompt()
 
     def __repr__(self) -> str:
         return (

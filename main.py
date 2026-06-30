@@ -69,15 +69,25 @@ def _resolve_dtype(mp: str) -> torch.dtype:
     return {"no": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(mp, torch.float32)
 
 
-def _to_minus_one_one(pil_image: Image.Image, image_size: int) -> torch.Tensor:
-    """Match the validation pipeline: short-side resize -> center crop -> tensor."""
-    w, h = pil_image.size
-    scale = image_size / min(w, h)
-    new_w, new_h = int(w * scale + 0.5), int(h * scale + 0.5)
-    pil_image = pil_image.resize((new_w, new_h), Image.BICUBIC)
-    left = (new_w - image_size) // 2
-    top = (new_h - image_size) // 2
-    pil_image = pil_image.crop((left, top, left + image_size, top + image_size))
+def _to_minus_one_one(pil_image: Image.Image, image_size: int, crop: bool = True) -> torch.Tensor:
+    """Convert PIL image to [-1, 1] tensor, optionally cropping to square.
+
+    * For validation/training, we use ``crop=True`` (center crop) to match the
+      square training patches.
+    * For inference, we use ``crop=False`` (full-image resize) so that we restore
+      the entire image area instead of throwing away the borders.
+    """
+    if crop:
+        w, h = pil_image.size
+        scale = image_size / min(w, h)
+        new_w, new_h = int(w * scale + 0.5), int(h * scale + 0.5)
+        pil_image = pil_image.resize((new_w, new_h), Image.BICUBIC)
+        left = (new_w - image_size) // 2
+        top = (new_h - image_size) // 2
+        pil_image = pil_image.crop((left, top, left + image_size, top + image_size))
+    else:
+        # Resize entire image to square without cropping.
+        pil_image = pil_image.resize((image_size, image_size), Image.BICUBIC)
     return ToTensorMinusOneOne()(pil_image).unsqueeze(0)  # (1, 3, H, W)
 
 
@@ -97,7 +107,12 @@ def cmd_train(cfg: dict) -> None:
 
 
 def cmd_infer(cfg: dict) -> None:
-    """Run single-image or batch-folder inference. All params come from YAML."""
+    """Run batch-folder inference. All params come from YAML.
+
+    The test directory is ``infer.input_dir``; the optional
+    ``infer.num_test_images`` cap limits how many images get processed
+    (per-weather when ``weather_from_subdir`` is True, otherwise global).
+    """
     project = cfg["project"]
     model_cfg = cfg["model"]
     weather_cfg = cfg["weather_prompt"]
@@ -132,6 +147,7 @@ def cmd_infer(cfg: dict) -> None:
         dtype=dtype,
         enable_xformers=project["enable_xformers"],
         gradient_checkpointing=False,
+        controlnet_hint_range=model_cfg.get("controlnet_hint_range", "zero_one"),
     )
     if os.path.isdir(ckpt_path):
         model.load_controlnet(ckpt_path)
@@ -146,88 +162,161 @@ def cmd_infer(cfg: dict) -> None:
     num_inference_steps = infer_cfg.get("num_inference_steps", train_cfg["num_inference_steps"])
 
     # ------------------------------------------------------------------
-    # Dispatch: single image vs. batch folder
+    # Dispatch: only batch-folder mode is supported.
     # ------------------------------------------------------------------
-    if infer_cfg.get("input_path"):
-        _infer_single(model, infer_cfg, device, dtype,
-                      image_size, guidance_scale, num_inference_steps)
-    elif infer_cfg.get("input_dir"):
-        _infer_batch(model, infer_cfg, device, dtype,
-                     image_size, guidance_scale, num_inference_steps)
-    else:
+    if not infer_cfg.get("input_dir"):
         raise ValueError(
-            "Inference YAML must define either 'input_path' (single image) "
-            "or 'input_dir' (batch folder)."
+            "Inference requires 'infer.input_dir' (the test directory) "
+            "and 'infer.output_dir' (where restored images are written)."
         )
+    _infer_batch(model, infer_cfg, cfg["dataset"], device, dtype,
+                 image_size, guidance_scale, num_inference_steps)
 
 
-def _infer_single(model, infer_cfg, device, dtype, image_size,
-                  guidance_scale, num_inference_steps) -> None:
-    input_path = infer_cfg["input_path"]
-    output_path = infer_cfg["output_path"]
-    weather = infer_cfg["weather"]
-
-    if not os.path.isfile(input_path):
-        raise FileNotFoundError(f"Input image not found: {input_path}")
-
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
-
-    pil = Image.open(input_path).convert("RGB")
-    tensor = _to_minus_one_one(pil, image_size).to(device, dtype=dtype)
-    out = model.sample(
-        degraded_pixel_values=tensor,
-        weather_labels=[weather],
-        guidance_scale=guidance_scale,
-        num_inference_steps=num_inference_steps,
-    )
-    _tensor_to_pil(out[0]).save(output_path)
-    logger.info("Saved restored image -> %s", output_path)
-
-
-def _infer_batch(model, infer_cfg, device, dtype, image_size,
+def _infer_batch(model, infer_cfg, dataset_cfg, device, dtype, image_size,
                  guidance_scale, num_inference_steps) -> None:
-    from datasets.weather_restoration import _list_images, SUPPORTED_EXTS
+    """Run restoration on the first N test images.
 
-    input_dir = infer_cfg["input_dir"]
-    output_dir = infer_cfg["output_dir"]
-    weather_from_subdir = infer_cfg.get("weather_from_subdir", False)
-    default_weather = infer_cfg.get("weather", "rain")
+    Directory contract (driven by ``dataset.*`` subdir names):
+
+    * ``LQ_DIR = <input_dir>/<test_subdir>/<lq_subdir>`` — degraded inputs
+    * ``GT_DIR = <input_dir>/<test_subdir>/<gt_subdir>`` — clean references
+
+    Output goes to a single timestamped folder with prefixed filenames::
+
+        <output_dir>/test/<YYYYMMDD_HHMMSS>/
+            LQ_rain-0000.png    <- copied LQ input
+            GT_rain-0000.png    <- copied GT reference (by stem match)
+            PRED_rain-0000.png  <- model-restored output
+            LQ_rain-0001.png
+            GT_rain-0001.png
+            PRED_rain-0001.png
+            ...
+    """
+    import shutil
+    from datetime import datetime
+    from glob import glob
+
+    input_dir: str = infer_cfg["input_dir"]
+    output_dir: str = infer_cfg["output_dir"]
+    weather: str = infer_cfg.get("weather", "rain")
+    num_test_images = infer_cfg.get("num_test_images")
+
+    # ------------------------------------------------------------------
+    # Resolve LQ / GT directories from the dataset subdir convention.
+    # ------------------------------------------------------------------
+    test_subdir: str = dataset_cfg.get("test_subdir", "test")
+    lq_subdir: str = dataset_cfg.get("lq_subdir", "LQ")
+    gt_subdir: str = dataset_cfg.get("gt_subdir", "GT")
+
+    lq_dir = os.path.join(input_dir, test_subdir, lq_subdir)
+    gt_dir = os.path.join(input_dir, test_subdir, gt_subdir)
 
     if not os.path.isdir(input_dir):
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
-    os.makedirs(output_dir, exist_ok=True)
+    if not os.path.isdir(lq_dir):
+        raise FileNotFoundError(
+            f"LQ directory not found: {lq_dir}\n"
+            f"(derived from input_dir={input_dir!r}, "
+            f"test_subdir={test_subdir!r}, lq_subdir={lq_subdir!r})"
+        )
+    if not os.path.isdir(gt_dir):
+        # GT missing is non-fatal — we just skip the GT copy and log it.
+        logger.warning("GT directory not found (continuing without GT copies): %s",
+                       gt_dir)
+        gt_dir = None  # type: ignore[assignment]
 
+    # ------------------------------------------------------------------
+    # Discover LQ images (non-recursive: LQ_DIR is a flat folder of images).
+    # ------------------------------------------------------------------
     exts = tuple(e.lower() for e in infer_cfg.get("image_extensions",
                                                   cfg_default_image_exts()))
-    images = _list_images(input_dir, exts)
+    images: List[str] = []
+    for ext in exts:
+        images.extend(glob(os.path.join(lq_dir, f"*{ext}")))
+    images = sorted(set(images))
+
     if not images:
-        logger.warning("No images found in %s", input_dir)
+        logger.warning("No images found in %s (exts=%s)", lq_dir, exts)
         return
 
+    # ------------------------------------------------------------------
+    # Optional cap on how many images to actually restore.  null/0/<=0 = no cap.
+    # ------------------------------------------------------------------
+    if num_test_images is not None and num_test_images > 0:
+        images = images[:num_test_images]
+
+    if not images:
+        logger.warning("No images left after applying num_test_images=%s cap.",
+                       num_test_images)
+        return
+
+    # ------------------------------------------------------------------
+    # Create a single per-run timestamped output directory; LQ/GT/PRED
+    # all land in this folder with a prefix on the filename so the user
+    # can sort/glob them easily.
+    # ------------------------------------------------------------------
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(output_dir, "test", timestamp)
+    os.makedirs(run_dir, exist_ok=True)
+
+    logger.info(
+        "Restoring %d image(s) | weather=%s | LQ=%s | GT=%s -> %s",
+        len(images), weather, lq_dir, gt_dir or "<missing>", run_dir,
+    )
+
+    # ------------------------------------------------------------------
+    # Per-image loop: write LQ_<name>, GT_<name>, PRED_<name> side by side.
+    # ------------------------------------------------------------------
     for img_path in images:
-        if weather_from_subdir:
-            # weather = immediate parent folder name
-            weather = os.path.basename(os.path.dirname(img_path))
-        else:
-            weather = default_weather
+        fname = os.path.basename(img_path)
+        stem, _ = os.path.splitext(fname)
+        prefixed = lambda tag: f"{tag}_{fname}"  # noqa: E731
 
-        # Mirror the input layout under output_dir so the user can sanity-check
-        # which image came from where.
-        rel = os.path.relpath(img_path, input_dir)
-        out_path = os.path.join(output_dir, rel)
-        os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+        # Always save the LQ (preserves original filename even if extension
+        # differs from GT, e.g. lq.png vs gt.jpg).
+        shutil.copy2(img_path, os.path.join(run_dir, prefixed("LQ")))
 
+        # Find a matching GT by stem (handles .png vs .jpg mismatches).
+        gt_src: Optional[str] = None
+        if gt_dir is not None:
+            direct = os.path.join(gt_dir, fname)
+            if os.path.isfile(direct):
+                gt_src = direct
+            else:
+                stem_matches = glob(os.path.join(gt_dir, f"{stem}.*"))
+                if stem_matches:
+                    gt_src = sorted(stem_matches)[0]
+            if gt_src is None:
+                logger.warning("No matching GT for %s in %s", fname, gt_dir)
+            else:
+                shutil.copy2(gt_src, os.path.join(run_dir, prefixed("GT")))
+
+        # Run the model and save PRED.
         pil = Image.open(img_path).convert("RGB")
-        tensor = _to_minus_one_one(pil, image_size).to(device, dtype=dtype)
+        orig_w, orig_h = pil_image_size = pil.size         # remember the input size
+        # We resize the entire image to square (crop=False) during inference,
+        # so when we scale PRED back to (orig_w, orig_h) at the end, the
+        # entire image is restored without border loss or aspect ratio stretching!
+        tensor = _to_minus_one_one(pil, image_size, crop=False).to(device, dtype=dtype)
         out = model.sample(
             degraded_pixel_values=tensor,
             weather_labels=[weather],
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
         )
-        _tensor_to_pil(out[0]).save(out_path)
-        logger.info("[%s/%s] %s -> %s", weather, os.path.basename(img_path),
-                    img_path, out_path)
+        pred_pil = _tensor_to_pil(out[0])                   # PIL, image_size × image_size
+        # Optional: stretch PRED back to the original input resolution
+        # so all three of LQ/GT/PRED line up pixel-for-pixel.
+        # The trade-off is that the model only saw the center crop, so
+        # upscaling interpolates details that the model never produced.
+        if infer_cfg.get("output_to_original_size", True):
+            pred_pil = pred_pil.resize((orig_w, orig_h), Image.BICUBIC)
+        pred_pil.save(os.path.join(run_dir, prefixed("PRED")))
+        logger.info(
+            "[%s] %s  ->  LQ/GT/PRED saved (%dx%d)",
+            weather, fname, orig_w, orig_h,
+        )
 
 
 def cfg_default_image_exts():

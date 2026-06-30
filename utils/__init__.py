@@ -7,6 +7,7 @@ from .config import (
     print_config,
 )
 from .logger import get_logger, seed_everything, setup_logging
+from .metrics import ImageQualityMeter
 
 __all__ = [
     "load_config",
@@ -16,4 +17,5 @@ __all__ = [
     "get_logger",
     "seed_everything",
     "setup_logging",
+    "ImageQualityMeter",
 ]

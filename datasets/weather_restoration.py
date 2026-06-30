@@ -59,6 +59,7 @@ class WeatherRestorationDataset(Dataset):
         random_flip: bool = True,
         random_crop: bool = True,
         max_samples: Optional[int] = None,
+        samples_per_weather: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.data_root = data_root
@@ -89,7 +90,10 @@ class WeatherRestorationDataset(Dataset):
             )
 
         exts = tuple(e.lower() for e in image_extensions)
-        self.samples: List[Tuple[str, str, str]] = []   # (lq_path, gt_path, weather)
+        # Walk the filesystem grouped by weather class. Accumulating per
+        # bucket first lets us apply an optional per-weather cap below, which
+        # keeps the dataset balanced when raw folder counts are skewed.
+        samples_by_weather: Dict[str, List[Tuple[str, str, str]]] = {}
 
         for weather in sorted(os.listdir(data_root)):
             weather_dir = os.path.join(data_root, weather)
@@ -97,13 +101,14 @@ class WeatherRestorationDataset(Dataset):
                 continue
             split_dir = os.path.join(weather_dir, split)
             if not os.path.isdir(split_dir):
-                # Weather class does not contain the requested split — skip.
+                # Weather class does not contain the requested split - skip.
                 continue
             lq_dir = os.path.join(split_dir, lq_subdir)
             gt_dir = os.path.join(split_dir, gt_subdir)
             if not (os.path.isdir(lq_dir) and os.path.isdir(gt_dir)):
                 continue
 
+            bucket: List[Tuple[str, str, str]] = []
             for lq_path in sorted(_list_images(lq_dir, exts)):
                 fname = os.path.basename(lq_path)
                 gt_path = os.path.join(gt_dir, fname)
@@ -114,14 +119,32 @@ class WeatherRestorationDataset(Dataset):
                     if not matches:
                         continue
                     gt_path = matches[0]
-                self.samples.append((lq_path, gt_path, weather))
+                bucket.append((lq_path, gt_path, weather))
+            if bucket:
+                samples_by_weather[weather] = bucket
 
-        if not self.samples:
+        if not samples_by_weather:
             raise RuntimeError(
                 f"No (LQ, GT) pairs found under {data_root}/<weather>/{split}/. "
                 f"Check that filenames match between '{lq_subdir}/' and '{gt_subdir}/'."
             )
 
+        # Optional per-weather sample cap (deterministic: keep first N of
+        # each bucket by sorted filename). Set via YAML to balance classes.
+        if samples_per_weather is not None and samples_per_weather > 0:
+            for weather in list(samples_by_weather.keys()):
+                bucket = samples_by_weather[weather]
+                if len(bucket) > samples_per_weather:
+                    samples_by_weather[weather] = bucket[:samples_per_weather]
+
+        # Flatten back into a single list in sorted weather order so dataset
+        # indexing is deterministic w.r.t. OS file ordering.
+        self.samples: List[Tuple[str, str, str]] = []
+        for weather in sorted(samples_by_weather):
+            self.samples.extend(samples_by_weather[weather])
+
+        # Optional overall cap (legacy max_samples parameter, applied after
+        # the per-weather cap as a final global truncation).
         if max_samples is not None and max_samples > 0:
             self.samples = self.samples[:max_samples]
 
@@ -204,6 +227,7 @@ def create_dataloader(
     random_flip: bool = True,
     random_crop: bool = True,
     max_samples: Optional[int] = None,
+    samples_per_weather: Optional[int] = None,
     pin_memory: bool = True,
     shuffle: Optional[bool] = None,
 ) -> DataLoader:
@@ -213,6 +237,10 @@ def create_dataloader(
     ----------
     shuffle
         Defaults to ``True`` for the train split and ``False`` for test.
+    samples_per_weather
+        Optional per-weather-class cap (e.g. 1000 keeps 1000 images per
+        ``rain`` / ``snow`` / ``haze`` bucket). Deterministic (first N by
+        sorted filename). ``None`` keeps everything per class.
     """
     dataset = WeatherRestorationDataset(
         data_root=data_root,
@@ -226,6 +254,7 @@ def create_dataloader(
         random_flip=random_flip,
         random_crop=random_crop,
         max_samples=max_samples,
+        samples_per_weather=samples_per_weather,
     )
 
     if shuffle is None:

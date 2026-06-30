@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate>=0.27.0",
+    "deg>=1.0.1",
     "diffusers>=0.27.0",
     "imageio>=2.34.0",
     "numpy>=1.24.0",
@@ -11,12 +12,13 @@ dependencies = [
     "pyyaml>=6.0",
     "safetensors>=0.4.0",
     "tensorboard>=2.15.0",
-    "torch>=2.12.1",
-    "torchvision>=0.27.1",
     "transformers>=4.38.0",
     "wandb>=0.16.0",
     "xformers>=0.0.23",
+    'triton>=3.7.1; sys_platform != "win32"',
+    "tqdm>=4.66.5",
+    "torchmetrics>=1.0.3",
 ]
 
-#[tool.uv]
-#extra-index-url = ["https://download.pytorch.org/whl/cu126"]
+[tool.uv]
+extra-index-url = ["https://download.pytorch.org/whl/cu126"]
