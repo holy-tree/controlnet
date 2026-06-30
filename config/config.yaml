@@ -1,0 +1,169 @@
+# =============================================================================
+# ControlNet Multi-Weather Image Restoration — Unified Configuration
+# -----------------------------------------------------------------------------
+# Single source of truth for every knob in the pipeline.  All paths, weights,
+# weather classes and inference targets live here.  Startup needs only:
+#
+#     python main.py --config config/config.yaml
+#
+# CLI flags ``--mode`` and ``--override`` are optional convenience switches
+# that take precedence over the YAML when supplied.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Project / runtime
+# -----------------------------------------------------------------------------
+project:
+  name: "controlnet_multi_weather"
+  mode: "train"                       # "train" | "infer"  (CLI --mode overrides)
+  output_dir: "./outputs"
+  seed: 42
+  device: "cuda"                      # "cuda" | "cpu"
+  num_gpus: 1                         # for logging only; torchrun can override
+  mixed_precision: "fp16"             # "no" | "fp16" | "bf16"
+  enable_xformers: true
+  gradient_checkpointing: true
+  print_config_on_start: true
+
+# -----------------------------------------------------------------------------
+# Model
+# -----------------------------------------------------------------------------
+model:
+  # SD2 base model (local path or HuggingFace repo id)
+  base_model_path: "stabilityai/stable-diffusion-2-base"
+  # ControlNet checkpoint path:
+  #   - training:   initial weights to resume from (null = random init)
+  #   - inference:  ignored unless infer.ckpt_path is null
+  controlnet_path: null
+  # Conditioning type expected by the loaded ControlNet
+  controlnet_hint_type: "degraded"    # "degraded" | "canny" | ...
+  image_channels: 3
+  latent_channels: 4
+  downsample_factor: 8
+
+# -----------------------------------------------------------------------------
+# Weather-category text conditioning
+# -----------------------------------------------------------------------------
+weather_prompt:
+  # Master switch: if true, prepend a weather-specific phrase to the prompt
+  use_weather_prompt: true
+  prompt_template: "a clean photo after removing {weather}, high quality, sharp"
+  negative_prompt: "blurry, low quality, artifacts, noise, distorted"
+  # Mapping from dataset folder name -> natural language token
+  weather_tokens:
+    rain: "rain"
+    snow: "snow"
+    haze: "fog"                       # "haze" folder is described as "fog" in prompts
+  # Classifier-free guidance dropout probability
+  cfg_dropout_prob: 0.1
+  empty_prompt: ""
+
+# -----------------------------------------------------------------------------
+# Dataset
+# -----------------------------------------------------------------------------
+# Expected layout (weather-first, no separate validation set):
+#
+#   <data_root>/
+#     rain/
+#       train/
+#         LQ/   # low-quality (degraded) images
+#         GT/   # ground-truth (clean) images — filenames must match LQ/
+#       test/
+#         LQ/
+#         GT/
+#     snow/
+#       train/{LQ,GT}
+#       test/{LQ,GT}
+#     haze/
+#       train/{LQ,GT}
+#       test/{LQ,GT}
+#
+# The "test" split is reused for periodic validation during training because
+# the dataset does not provide a separate validation set.
+dataset:
+  data_root: "./data"
+  train_subdir: "train"
+  test_subdir:  "test"
+  lq_subdir:    "LQ"
+  gt_subdir:    "GT"
+  image_extensions:
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".bmp"
+    - ".webp"
+  image_size: 512
+  random_flip: true
+  random_crop: true
+  normalize_range: "minus_one_one"    # "minus_one_one" | "zero_one"
+  num_workers: 4
+  test_max_samples: 16                # cap on validation-time samples
+
+# -----------------------------------------------------------------------------
+# Training hyperparameters
+# -----------------------------------------------------------------------------
+train:
+  num_train_epochs: 20
+  max_train_steps: null               # if set, overrides num_train_epochs
+  batch_size: 4
+  gradient_accumulation_steps: 1
+
+  learning_rate: 1.0e-5
+  lr_scheduler: "constant"            # "constant" | "linear" | "cosine" | "cosine_with_restarts"
+  lr_warmup_steps: 500
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-2
+  adam_epsilon:  1.0e-8
+  max_grad_norm: 1.0
+
+  prediction_type: "epsilon"          # "epsilon" | "v_prediction"
+  noise_offset: 0.0
+
+  validation_steps: 500
+  checkpointing_steps: 1000
+  checkpoints_total_limit: 3
+  resume_from_checkpoint: null       # path to checkpoint dir, or "latest"
+  num_validation_images: 4
+  guidance_scale: 7.5
+  num_inference_steps: 30
+
+  log_every_n_steps: 20
+  report_to: "tensorboard"            # "tensorboard" | "wandb" | "none"
+  tracker_project_name: "controlnet-multi-weather"
+  dataloader_pin_memory: true
+
+# -----------------------------------------------------------------------------
+# Inference / one-shot restoration
+# -----------------------------------------------------------------------------
+# Activated when ``project.mode == "infer"``.  All paths and parameters needed
+# by ``python main.py --mode infer`` live here — no extra CLI args required.
+#
+# Two modes are supported (controlled by which paths are set):
+#
+#   (a) Single image — set ``input_path`` and ``output_path``.
+#   (b) Batch folder — set ``input_dir`` and ``output_dir``.
+#       * If ``weather_from_subdir`` is true, the immediate parent folder
+#         name of each image (e.g. "rain", "snow", "haze") is used as the
+#         weather label and also looked up in ``weather_prompt.weather_tokens``.
+#       * Otherwise ``weather`` is applied to every image.
+infer:
+  # ControlNet weights to load.  Falls back to model.controlnet_path when null.
+  ckpt_path: "./outputs/controlnet_multi_weather/checkpoint-1000"
+
+  # (a) Single image mode
+  input_path: "./demo/rainy.png"
+  output_path: "./demo/rainy_restored.png"
+  weather: "rain"                     # "rain" | "snow" | "haze"
+
+  # (b) Batch folder mode (only used when input_path is null)
+  input_dir: null                     # e.g. "./demo/batch_in"
+  output_dir: null                    # e.g. "./demo/batch_out"
+  weather_from_subdir: false
+  # When weather_from_subdir=false, this weather label is applied to all images
+  # in the batch directory.
+
+  # Sampling parameters (override train.* values for inference)
+  guidance_scale: 7.5
+  num_inference_steps: 30
+  image_size: 512                     # resize short side -> center crop to this size
