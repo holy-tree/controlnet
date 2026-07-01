@@ -33,6 +33,7 @@ from glob import glob
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
@@ -152,13 +153,16 @@ class WeatherRestorationDataset(Dataset):
         # Transforms
         # ------------------------------------------------------------------
         if split == train_subdir and random_crop:
-            from .transforms import PairedRandomCrop, PairedRandomFlip
-            self.transforms: List[Callable] = [PairedRandomCrop(image_size)]
+            from .transforms import PairedResizeNative, PairedRandomFlip
+            self.transforms: List[Callable] = [PairedResizeNative(image_size)]
             if random_flip:
                 self.transforms.append(PairedRandomFlip(p=0.5))
+        elif split == train_subdir:
+            from .transforms import PairedResizeNative
+            self.transforms = [PairedResizeNative(image_size)]
         else:
-            from .transforms import _CenterCropResize
-            self.transforms = [_CenterCropResize(image_size)]
+            from .transforms import PairedResizeNative
+            self.transforms = [PairedResizeNative(image_size)]
 
         from .transforms import _ToTensorBoth
         self.transforms.append(_ToTensorBoth())
@@ -208,6 +212,41 @@ def _list_images(
     if stem is not None:
         files = [f for f in files if os.path.splitext(os.path.basename(f))[0] == stem]
     return sorted(files)
+
+
+# -----------------------------------------------------------------------------
+# Custom collate for variable-resolution batches
+# -----------------------------------------------------------------------------
+def _collate_var_resolution(batch: List[Dict]) -> Dict[str, object]:
+    """Collate a list of {"lq", "gt", "weather", "lq_path"} samples.
+
+    All samples are padded to the maximum H/W in the batch (right/bottom only)
+    so they form a single BCHW tensor.  The original shape is stored in
+    ``orig_size`` so downstream code can crop back if needed.
+    """
+    lq_tensors = [item["lq"] for item in batch]
+    gt_tensors = [item["gt"] for item in batch]
+    max_h = max(t.shape[1] for t in lq_tensors)
+    max_w = max(t.shape[2] for t in lq_tensors)
+    pad_h = max_h - max_h % 8
+    pad_w = max_w - max_w % 8
+
+    def _pad(t: torch.Tensor) -> torch.Tensor:
+        ph = max(0, pad_h - t.shape[1])
+        pw = max(0, pad_w - t.shape[2])
+        if ph or pw:
+            t = F.pad(t, (0, pw, 0, ph), mode="constant", value=0.0)
+        return t
+
+    lq_padded = torch.stack([_pad(t) for t in lq_tensors], dim=0)
+    gt_padded = torch.stack([_pad(t) for t in gt_tensors], dim=0)
+
+    return {
+        "lq": lq_padded,
+        "gt": gt_padded,
+        "weather": [item["weather"] for item in batch],
+        "lq_path": [item["lq_path"] for item in batch],
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -267,4 +306,5 @@ def create_dataloader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=(split == train_subdir),
+        collate_fn=_collate_var_resolution,
     )

@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
@@ -135,6 +136,7 @@ class ControlNetRestorationModel:
                 "checkpoint that matches model.base_model_path."
             )
             self.controlnet = ControlNetModel.from_unet(self.unet)
+            self._random_init_customize()
 
         # ------------------------------------------------------------------
         # 3. Freeze everything except ControlNet
@@ -510,6 +512,179 @@ class ControlNetRestorationModel:
     def save_controlnet(self, output_dir: str) -> None:
         os.makedirs(output_dir, exist_ok=True)
         self.controlnet.save_pretrained(output_dir)
+
+    # ------------------------------------------------------------------ #
+    # Random-init customisation
+    # ------------------------------------------------------------------ #
+    def _random_init_customize(self) -> None:
+        """Tune freshly-initialised ControlNet for [-1,1] image restoration.
+
+        Called only when ControlNet was randomly initialised (no pretrained checkpoint).
+        Zero-convolutions and conv_in receive special treatment so the network
+        can forward a [-1,1] degraded hint without numerical mismatch.
+        """
+        def _init_conv_in(m):
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, mean=0.0, std=1e-4)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        def _init_zero_convs(module):
+            for child in module.children():
+                if isinstance(child, nn.Conv2d) and child.out_channels == 4:
+                    nn.init.zeros_(child.weight)
+                    if child.bias is not None:
+                        nn.init.zeros_(child.bias)
+                else:
+                    _init_zero_convs(child)
+
+        embed = self.controlnet.controlnet_cond_embedding
+        embed.conv_in.apply(_init_conv_in)
+
+        for block in (embed.block1_1, embed.block1_2,
+                      embed.block2_1, embed.block2_2, embed.block2_3,
+                      embed.block3_1, embed.block3_2, embed.block3_3,
+                      embed.block4_1, embed.block4_2, embed.block4_3, embed.block4_4,
+                      self.controlnet.mid_block):
+            if hasattr(block, 'zero_conv'):
+                for zc in block.zero_conv:
+                    nn.init.zeros_(zc.weight)
+                    if zc.bias is not None:
+                        nn.init.zeros_(zc.bias)
+
+        logger.info("Random-init ControlNet customised for [-1,1] hint range.")
+
+    # ------------------------------------------------------------------ #
+    # Tiled / variable-resolution inference
+    # ------------------------------------------------------------------ #
+    @torch.amp.autocast("cuda", enabled=False)
+    def sample_tiled(
+        self,
+        degraded_pixel_values: torch.Tensor,
+        weather_labels: Sequence[str],
+        guidance_scale: float = 2.5,
+        num_inference_steps: int = 30,
+        tile_size: int = 512,
+        tile_stride: int = 384,
+        blend_sigma: float = 32.0,
+        upscale_to: int = 0,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Variable-resolution inference via overlapping tiles.
+
+        Parameters
+        ----------
+        degraded_pixel_values : (B, 3, H, W) in [-1, 1]
+        weather_labels        : weather strings for prompt encoder
+        guidance_scale        : CFG scale (2.5 typical for restoration)
+        num_inference_steps   : diffusion steps per tile
+        tile_size             : square window size (default 512, must be multiple of 8)
+        tile_stride           : step between windows (default 384 → ~25% overlap)
+        blend_sigma           : Gaussian sigma for feathered blending (default stride/12)
+        upscale_to            : if > 0, upscale short side to this before inference,
+                                 then crop back to original size at output
+        """
+        from diffusers import StableDiffusionControlNetPipeline
+
+        B, C, H_orig, W_orig = degraded_pixel_values.shape
+        device = degraded_pixel_values.device
+        H_curr, W_curr = H_orig, W_orig
+
+        if upscale_to > 0 and min(H_orig, W_orig) < upscale_to:
+            scale = upscale_to / min(H_orig, W_orig)
+            new_h = int(H_orig * scale + 0.5)
+            new_w = int(W_orig * scale + 0.5)
+            new_h = max(8, new_h - new_h % 8)
+            new_w = max(8, new_w - new_w % 8)
+            degraded_pixel_values = F.interpolate(
+                degraded_pixel_values, size=(new_h, new_w), mode="bicubic", align_corners=False
+            )
+            H_curr, W_curr = new_h, new_w
+
+        pad_h = (tile_stride - H_curr % tile_stride) % tile_stride
+        pad_w = (tile_stride - W_curr % tile_stride) % tile_stride
+        if pad_h or pad_w:
+            degraded_pixel_values = F.pad(
+                degraded_pixel_values, (0, pad_w, 0, pad_h), mode="reflect"
+            )
+
+        H_pad, W_pad = degraded_pixel_values.shape[2], degraded_pixel_values.shape[3]
+
+        if blend_sigma <= 0:
+            blend_sigma = tile_stride / 12.0
+        weight_map = self._build_gaussian_weight(tile_size, blend_sigma, device)
+
+        output_accum = torch.zeros((B, 3, H_pad, W_pad), device=device, dtype=self.dtype)
+        weight_accum = torch.zeros((B, 1, H_pad, W_pad), device=device, dtype=self.dtype)
+
+        num_rows = max(1, (H_pad - tile_size) // tile_stride + 1)
+        num_cols = max(1, (W_pad - tile_size) // tile_stride + 1)
+
+        wp = self.weather_prompt_encoder.build_prompts(weather_labels)
+
+        pipe = StableDiffusionControlNetPipeline(
+            vae=self.vae,
+            text_encoder=self.text_encoder,
+            tokenizer=self.tokenizer,
+            unet=self.unet,
+            controlnet=self.controlnet,
+            scheduler=self.noise_scheduler,
+            safety_checker=None,
+            feature_extractor=None,
+        )
+        pipe.set_progress_bar_config(disable=True)
+        if self.controlnet_hint_range == "zero_one":
+            pipe.image_processor.do_normalize = False
+
+        y_positions = [r * tile_stride for r in range(num_rows)]
+        x_positions = [c * tile_stride for c in range(num_cols)]
+        if y_positions[-1] + tile_size > H_pad:
+            y_positions[-1] = H_pad - tile_size
+        if x_positions[-1] + tile_size > W_pad:
+            x_positions[-1] = W_pad - tile_size
+
+        for y in y_positions:
+            for x in x_positions:
+                tile = degraded_pixel_values[:, :, y:y+tile_size, x:x+tile_size]
+                pil_tile = self._tensor_to_pil(tile)
+
+                with torch.amp.autocast(
+                    device_type="cuda" if self.device.type == "cuda" else "cpu",
+                    enabled=(self.dtype != torch.float32),
+                    dtype=self.dtype,
+                ):
+                    out_tile = pipe(
+                        prompt=wp.prompts,
+                        negative_prompt=None,
+                        image=pil_tile,
+                        num_inference_steps=num_inference_steps,
+                        guidance_scale=guidance_scale,
+                        generator=generator,
+                        output_type="pt",
+                    ).images
+
+                out_tile = out_tile.to(device=self.device, dtype=self.dtype)
+                output_accum[:, :, y:y+tile_size, x:x+tile_size] += out_tile * weight_map
+                weight_accum[:, :, y:y+tile_size, x:x+tile_size] += weight_map
+
+        output_accum = output_accum / weight_accum.clamp(min=1e-8)
+        output = output_accum[:, :, :H_curr, :W_curr]
+
+        if upscale_to > 0 and (H_curr != H_orig or W_curr != W_orig):
+            output = F.interpolate(
+                output, size=(H_orig, W_orig), mode="bicubic", align_corners=False
+            )
+
+        return output.clamp(-1, 1)
+
+    @staticmethod
+    @staticmethod
+    def _build_gaussian_weight(tile_size: int, sigma: float, device: torch.device):
+        half = tile_size / 2.0
+        coords = torch.linspace(-half, half, tile_size, device=device)
+        y_g, x_g = torch.meshgrid(coords, coords, indexing="ij")
+        g = torch.exp(-(x_g**2 + y_g**2) / (2 * sigma**2))
+        return g.unsqueeze(0).unsqueeze(0)
 
     def load_controlnet(self, path: str) -> None:
         from diffusers import ControlNetModel

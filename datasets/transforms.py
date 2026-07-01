@@ -62,7 +62,6 @@ class PairedRandomCrop:
     ) -> Tuple[Image.Image, Image.Image]:
         w, h = degraded.size
         if w < self.size or h < self.size:
-            # Resize up if the image is smaller than the crop size.
             scale = max(self.size / w, self.size / h)
             new_w, new_h = int(w * scale + 0.5), int(h * scale + 0.5)
             degraded = degraded.resize((new_w, new_h), Image.BICUBIC)
@@ -73,6 +72,54 @@ class PairedRandomCrop:
         y = random.randint(0, h - self.size)
         box = (x, y, x + self.size, y + self.size)
         return degraded.crop(box), clean.crop(box)
+
+
+class PairedRandomCropNative:
+    """Random crop preserving original aspect ratio; crop to min(H,W) then resize to ``size``."""
+
+    def __init__(self, size: int = 256) -> None:
+        self.size = size
+
+    def __call__(
+        self,
+        degraded: Image.Image,
+        clean: Image.Image,
+    ) -> Tuple[Image.Image, Image.Image]:
+        w, h = degraded.size
+        crop_size = min(w, h, self.size)
+        x = random.randint(0, w - crop_size)
+        y = random.randint(0, h - crop_size)
+        degraded = degraded.crop((x, y, x + crop_size, y + crop_size))
+        clean = clean.crop((x, y, x + crop_size, y + crop_size))
+        degraded = degraded.resize((self.size, self.size), Image.BICUBIC)
+        clean = clean.resize((self.size, self.size), Image.BICUBIC)
+        return degraded, clean
+
+
+class PairedResizeNative:
+    """Resize short side to ``short_side``, round both dims to nearest multiple of 8.
+
+    Preserves aspect ratio. Both H and W are guaranteed to be divisible by 8,
+    which is required by the VAE / UNet pipeline.
+    """
+
+    def __init__(self, short_side: int = 512) -> None:
+        self.short_side = short_side
+
+    def __call__(
+        self,
+        degraded: Image.Image,
+        clean: Image.Image,
+    ) -> Tuple[Image.Image, Image.Image]:
+        w, h = degraded.size
+        scale = self.short_side / min(w, h)
+        new_w = int(w * scale + 0.5)
+        new_h = int(h * scale + 0.5)
+        new_w = max(8, new_w - new_w % 8)
+        new_h = max(8, new_h - new_h % 8)
+        degraded = degraded.resize((new_w, new_h), Image.BICUBIC)
+        clean = clean.resize((new_w, new_h), Image.BICUBIC)
+        return degraded, clean
 
 
 # -----------------------------------------------------------------------------

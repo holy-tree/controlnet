@@ -1,19 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="3b8ccc7b-4728-4420-9ce4-9c35df66c024" name="更改" comment="[feat] sd2 controlnet 训练框架">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+    <list default="true" id="3b8ccc7b-4728-4420-9ce4-9c35df66c024" name="更改" comment="[fix] infer.yaml">
       <change beforePath="$PROJECT_DIR$/config/config.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/config/config.yaml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/config/infer.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/config/infer.yaml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/datasets/transforms.py" beforeDir="false" afterPath="$PROJECT_DIR$/datasets/transforms.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/datasets/weather_restoration.py" beforeDir="false" afterPath="$PROJECT_DIR$/datasets/weather_restoration.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/models/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/models/__init__.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/models/controlnet_wrapper.py" beforeDir="false" afterPath="$PROJECT_DIR$/models/controlnet_wrapper.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/models/weather_conditioning.py" beforeDir="false" afterPath="$PROJECT_DIR$/models/weather_conditioning.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/pyproject.toml" beforeDir="false" afterPath="$PROJECT_DIR$/pyproject.toml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/train.py" beforeDir="false" afterPath="$PROJECT_DIR$/train.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/uv.lock" beforeDir="false" afterPath="$PROJECT_DIR$/uv.lock" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -31,6 +25,18 @@
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
     <option name="RESET_MODE" value="MIXED" />
   </component>
+  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
+  "lastFilter": {
+    "state": "OPEN",
+    "assignee": "holy-tree"
+  }
+}]]></component>
+  <component name="GithubPullRequestsUISettings"><![CDATA[{
+  "selectedUrlAndAccountId": {
+    "url": "git@github.com:holy-tree/controlnet.git",
+    "accountId": "0ea7827b-8658-4313-a427-5ba7d34b39c6"
+  }
+}]]></component>
   <component name="ProjectColorInfo"><![CDATA[{
   "associatedIndex": 4,
   "fromUser": false
@@ -69,7 +75,7 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1782799861912</updated>
-      <workItem from="1782799862945" duration="24234000" />
+      <workItem from="1782799862945" duration="28421000" />
     </task>
     <task id="LOCAL-00001" summary="[feat] sd2 controlnet 训练框架">
       <option name="closed" value="true" />
@@ -95,7 +101,23 @@
       <option name="project" value="LOCAL" />
       <updated>1782800349418</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary="[fix] 修改模型内部逻辑">
+      <option name="closed" value="true" />
+      <created>1782836403428</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1782836403428</updated>
+    </task>
+    <task id="LOCAL-00005" summary="[fix] infer.yaml">
+      <option name="closed" value="true" />
+      <created>1782836428541</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1782836428541</updated>
+    </task>
+    <option name="localTasksCounter" value="6" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -114,6 +136,8 @@
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="[feat] sd2 controlnet 训练框架" />
-    <option name="LAST_COMMIT_MESSAGE" value="[feat] sd2 controlnet 训练框架" />
+    <MESSAGE value="[fix] 修改模型内部逻辑" />
+    <MESSAGE value="[fix] infer.yaml" />
+    <option name="LAST_COMMIT_MESSAGE" value="[fix] infer.yaml" />
   </component>
 </project>

@@ -732,12 +732,29 @@ class Trainer:
             gt = batch["gt"].to(self.device, dtype=self.dtype)
             weather = list(batch["weather"])
 
-            preds = self.model.sample(
-                degraded_pixel_values=lq,
-                weather_labels=weather,
-                guidance_scale=self.train_cfg["guidance_scale"],
-                num_inference_steps=self.train_cfg["num_inference_steps"],
-            )
+            tile_size = self.cfg["infer"].get("tile_size", 0)
+            tile_stride = self.cfg["infer"].get("tile_stride", 0)
+            tile_blend_sigma = self.cfg["infer"].get("tile_blend_sigma", 0.0)
+            preview_size = self.train_cfg.get("preview_image_size", 0)
+
+            if tile_size > 0 and tile_stride > 0:
+                preds = self.model.sample_tiled(
+                    degraded_pixel_values=lq,
+                    weather_labels=weather,
+                    guidance_scale=self.train_cfg["guidance_scale"],
+                    num_inference_steps=self.train_cfg["num_inference_steps"],
+                    tile_size=tile_size,
+                    tile_stride=tile_stride,
+                    blend_sigma=tile_blend_sigma,
+                    upscale_to=preview_size,
+                )
+            else:
+                preds = self.model.sample(
+                    degraded_pixel_values=lq,
+                    weather_labels=weather,
+                    guidance_scale=self.train_cfg["guidance_scale"],
+                    num_inference_steps=self.train_cfg["num_inference_steps"],
+                )
 
             # Accumulate PSNR/SSIM over the full test set.
             if compute_metrics:
