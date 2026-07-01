@@ -158,7 +158,6 @@ class Trainer:
             train_subdir=self.dataset_cfg["train_subdir"],
             test_subdir=self.dataset_cfg["test_subdir"],
             random_flip=self.dataset_cfg["random_flip"],
-            random_crop=self.dataset_cfg["random_crop"],
             samples_per_weather=self.dataset_cfg.get("samples_per_weather"),
             pin_memory=self.train_cfg["dataloader_pin_memory"],
         )
@@ -176,7 +175,6 @@ class Trainer:
             train_subdir=self.dataset_cfg["train_subdir"],
             test_subdir=self.dataset_cfg["test_subdir"],
             random_flip=False,
-            random_crop=False,
             samples_per_weather=self.dataset_cfg.get("samples_per_weather"),
             val_samples_per_weather=self.train_cfg.get("num_validation_images"),
             pin_memory=self.train_cfg["dataloader_pin_memory"],

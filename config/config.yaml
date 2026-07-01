@@ -61,10 +61,7 @@ dataset:
   image_extensions: [".png", ".jpg", ".jpeg", ".bmp", ".webp"]
   image_size: 128                   # short side; H/W rounded to nearest %8
   random_flip: true
-  random_crop: true
-  normalize_range: "minus_one_one"
   num_workers: 8
-  test_max_samples: 16
   samples_per_weather: 8          # per-class cap; null = no limit
 
 # =============================================================================

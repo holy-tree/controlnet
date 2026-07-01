@@ -49,53 +49,6 @@ class PairedRandomFlip:
         return degraded, clean
 
 
-class PairedRandomCrop:
-    """Random square crop of size ``size`` applied to both images."""
-
-    def __init__(self, size: int) -> None:
-        self.size = size
-
-    def __call__(
-        self,
-        degraded: Image.Image,
-        clean: Image.Image,
-    ) -> Tuple[Image.Image, Image.Image]:
-        w, h = degraded.size
-        if w < self.size or h < self.size:
-            scale = max(self.size / w, self.size / h)
-            new_w, new_h = int(w * scale + 0.5), int(h * scale + 0.5)
-            degraded = degraded.resize((new_w, new_h), Image.BICUBIC)
-            clean = clean.resize((new_w, new_h), Image.BICUBIC)
-            w, h = degraded.size
-
-        x = random.randint(0, w - self.size)
-        y = random.randint(0, h - self.size)
-        box = (x, y, x + self.size, y + self.size)
-        return degraded.crop(box), clean.crop(box)
-
-
-class PairedRandomCropNative:
-    """Random crop preserving original aspect ratio; crop to min(H,W) then resize to ``size``."""
-
-    def __init__(self, size: int = 256) -> None:
-        self.size = size
-
-    def __call__(
-        self,
-        degraded: Image.Image,
-        clean: Image.Image,
-    ) -> Tuple[Image.Image, Image.Image]:
-        w, h = degraded.size
-        crop_size = min(w, h, self.size)
-        x = random.randint(0, w - crop_size)
-        y = random.randint(0, h - crop_size)
-        degraded = degraded.crop((x, y, x + crop_size, y + crop_size))
-        clean = clean.crop((x, y, x + crop_size, y + crop_size))
-        degraded = degraded.resize((self.size, self.size), Image.BICUBIC)
-        clean = clean.resize((self.size, self.size), Image.BICUBIC)
-        return degraded, clean
-
-
 class PairedResizeNative:
     """Resize short side to ``short_side``, round both dims to nearest multiple of 8.
 
@@ -122,21 +75,54 @@ class PairedResizeNative:
         return degraded, clean
 
 
-# -----------------------------------------------------------------------------
-# Composition helpers
-# -----------------------------------------------------------------------------
-def build_train_transforms(image_size: int, random_flip: bool = True):
-    """Compose a transform list for the training set."""
-    transforms = [PairedRandomCrop(image_size)]
-    if random_flip:
-        transforms.append(PairedRandomFlip(p=0.5))
-    transforms.append(_ToTensorBoth())
-    return transforms
+class PairedCenterCropSquare:
+    """Center-crop the image to a square of side ``min(W, H)``.
+
+    Designed to be applied **after** :class:`PairedResizeNative`: the resize
+    preserves aspect ratio, so the short side is exactly ``image_size`` and
+    the long side is the multiple-of-8 rounded counterpart.  This transform
+    trims the long side down to the short side by taking the central square,
+    giving a square ``(image_size, image_size)`` tensor that is the canonical
+    input shape for the SD2 / ControlNet pipeline.
+    """
+
+    def __call__(
+        self,
+        degraded: Image.Image,
+        clean: Image.Image,
+    ) -> Tuple[Image.Image, Image.Image]:
+        w, h = degraded.size
+        crop = min(w, h)
+        if w == h:
+            return degraded, clean
+        left = (w - crop) // 2
+        top = (h - crop) // 2
+        box = (left, top, left + crop, top + crop)
+        return degraded.crop(box), clean.crop(box)
 
 
-def build_val_transforms(image_size: int):
-    """Compose a deterministic transform list for the validation set."""
-    return [_CenterCropResize(image_size), _ToTensorBoth()]
+class PairedRandomCropSquare:
+    """Random crop to a square of side ``min(W, H)``.
+
+    Same as :class:`PairedCenterCropSquare` but the crop offset is sampled
+    uniformly within the image.  Both images are cropped with the **same**
+    random offset so LQ and GT remain spatially aligned.  Use this for the
+    train split; for validation prefer the deterministic center crop.
+    """
+
+    def __call__(
+        self,
+        degraded: Image.Image,
+        clean: Image.Image,
+    ) -> Tuple[Image.Image, Image.Image]:
+        w, h = degraded.size
+        crop = min(w, h)
+        if w == h:
+            return degraded, clean
+        x = random.randint(0, w - crop)
+        y = random.randint(0, h - crop)
+        box = (x, y, x + crop, y + crop)
+        return degraded.crop(box), clean.crop(box)
 
 
 # -----------------------------------------------------------------------------
@@ -150,25 +136,3 @@ class _ToTensorBoth:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         converter = ToTensorMinusOneOne()
         return converter(degraded), converter(clean)
-
-
-class _CenterCropResize:
-    def __init__(self, size: int) -> None:
-        self.size = size
-
-    def __call__(
-        self,
-        degraded: Image.Image,
-        clean: Image.Image,
-    ) -> Tuple[Image.Image, Image.Image]:
-        # Match ControlNet / SD2: force the short side then center-crop.
-        w, h = degraded.size
-        scale = self.size / min(w, h)
-        new_w, new_h = int(w * scale + 0.5), int(h * scale + 0.5)
-        degraded = degraded.resize((new_w, new_h), Image.BICUBIC)
-        clean = clean.resize((new_w, new_h), Image.BICUBIC)
-
-        left = (new_w - self.size) // 2
-        top = (new_h - self.size) // 2
-        box = (left, top, left + self.size, top + self.size)
-        return degraded.crop(box), clean.crop(box)

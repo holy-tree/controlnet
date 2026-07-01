@@ -58,7 +58,6 @@ class WeatherRestorationDataset(Dataset):
         image_extensions: Sequence[str] = SUPPORTED_EXTS,
         image_size: int = 512,
         random_flip: bool = True,
-        random_crop: bool = True,
         max_samples: Optional[int] = None,
         samples_per_weather: Optional[int] = None,
         val_samples_per_weather: Optional[int] = None,
@@ -142,17 +141,19 @@ class WeatherRestorationDataset(Dataset):
         # ------------------------------------------------------------------
         # Transforms
         # ------------------------------------------------------------------
-        if split == train_subdir and random_crop:
-            from .transforms import PairedResizeNative, PairedRandomFlip
-            self.transforms: List[Callable] = [PairedResizeNative(image_size)]
-            if random_flip:
-                self.transforms.append(PairedRandomFlip(p=0.5))
-        elif split == train_subdir:
-            from .transforms import PairedResizeNative
-            self.transforms = [PairedResizeNative(image_size)]
+        from .transforms import (
+            PairedResizeNative,
+            PairedCenterCropSquare,
+            PairedRandomCropSquare,
+            PairedRandomFlip,
+        )
+        self.transforms: List[Callable] = [PairedResizeNative(image_size)]
+        if split == train_subdir:
+            self.transforms.append(PairedRandomCropSquare())
         else:
-            from .transforms import PairedResizeNative
-            self.transforms = [PairedResizeNative(image_size)]
+            self.transforms.append(PairedCenterCropSquare())
+        if split == train_subdir and random_flip:
+            self.transforms.append(PairedRandomFlip(p=0.5))
 
         from .transforms import _ToTensorBoth
         self.transforms.append(_ToTensorBoth())
@@ -261,7 +262,6 @@ def create_dataloader(
     train_subdir: str = "train",
     test_subdir: str = "test",
     random_flip: bool = True,
-    random_crop: bool = True,
     max_samples: Optional[int] = None,
     samples_per_weather: Optional[int] = None,
     val_samples_per_weather: Optional[int] = None,
@@ -290,7 +290,6 @@ def create_dataloader(
         image_extensions=image_extensions,
         image_size=image_size,
         random_flip=random_flip,
-        random_crop=random_crop,
         max_samples=max_samples,
         samples_per_weather=samples_per_weather,
         val_samples_per_weather=val_samples_per_weather,
