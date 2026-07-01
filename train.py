@@ -367,8 +367,6 @@ class Trainer:
         accum = max(1, self.train_cfg["gradient_accumulation_steps"])
         log_every = self.train_cfg["log_every_n_steps"]
         grad_clip = self.train_cfg["max_grad_norm"]
-        ckpt_every = self.train_cfg["checkpointing_steps"]
-        val_every = self.train_cfg["validation_steps"]
         show_bar = bool(self.train_cfg.get("show_progress_bar", True))
 
         # ------------------------------------------------------------------

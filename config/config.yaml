@@ -72,7 +72,7 @@ dataset:
 # =============================================================================
 train:
   # --- Schedule ---
-  num_train_epochs: 20
+  num_train_epochs: 80
   max_train_steps: null              # overrides num_train_epochs if set
   batch_size: 4
   gradient_accumulation_steps: 1
@@ -89,8 +89,6 @@ train:
   prediction_type: "epsilon"         # "epsilon" | "v_prediction"
   noise_offset: 0.0
   # --- Checkpointing ---
-  validation_steps: 5000
-  checkpointing_steps: 5000
   checkpointing_epochs: 1            # null = disabled
   checkpoints_total_limit: 3
   resume_from_checkpoint: null       # path or "latest"
