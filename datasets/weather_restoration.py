@@ -61,15 +61,13 @@ class WeatherRestorationDataset(Dataset):
         random_crop: bool = True,
         max_samples: Optional[int] = None,
         samples_per_weather: Optional[int] = None,
+        val_samples_per_weather: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.data_root = data_root
         self.split = split
         self.image_size = image_size
 
-        # ------------------------------------------------------------------
-        # Validate that the requested split is one of the known ones.
-        # ------------------------------------------------------------------
         known_splits = {train_subdir, test_subdir}
         if split not in known_splits:
             raise ValueError(
@@ -78,9 +76,6 @@ class WeatherRestorationDataset(Dataset):
                 f"want to use different folder names."
             )
 
-        # ------------------------------------------------------------------
-        # Discover (LQ, GT) pairs grouped by weather class.
-        # ------------------------------------------------------------------
         if not os.path.isdir(data_root):
             layout = (
                 f"{data_root}/<weather>/<train|test>/"
@@ -91,9 +86,6 @@ class WeatherRestorationDataset(Dataset):
             )
 
         exts = tuple(e.lower() for e in image_extensions)
-        # Walk the filesystem grouped by weather class. Accumulating per
-        # bucket first lets us apply an optional per-weather cap below, which
-        # keeps the dataset balanced when raw folder counts are skewed.
         samples_by_weather: Dict[str, List[Tuple[str, str, str]]] = {}
 
         for weather in sorted(os.listdir(data_root)):
@@ -102,7 +94,6 @@ class WeatherRestorationDataset(Dataset):
                 continue
             split_dir = os.path.join(weather_dir, split)
             if not os.path.isdir(split_dir):
-                # Weather class does not contain the requested split - skip.
                 continue
             lq_dir = os.path.join(split_dir, lq_subdir)
             gt_dir = os.path.join(split_dir, gt_subdir)
@@ -114,7 +105,6 @@ class WeatherRestorationDataset(Dataset):
                 fname = os.path.basename(lq_path)
                 gt_path = os.path.join(gt_dir, fname)
                 if not os.path.isfile(gt_path):
-                    # Fall back to filename stem match (handles .png vs .jpg).
                     stem, _ = os.path.splitext(fname)
                     matches = _list_images(gt_dir, exts, stem=stem)
                     if not matches:
@@ -130,22 +120,22 @@ class WeatherRestorationDataset(Dataset):
                 f"Check that filenames match between '{lq_subdir}/' and '{gt_subdir}/'."
             )
 
-        # Optional per-weather sample cap (deterministic: keep first N of
-        # each bucket by sorted filename). Set via YAML to balance classes.
         if samples_per_weather is not None and samples_per_weather > 0:
             for weather in list(samples_by_weather.keys()):
                 bucket = samples_by_weather[weather]
                 if len(bucket) > samples_per_weather:
                     samples_by_weather[weather] = bucket[:samples_per_weather]
 
-        # Flatten back into a single list in sorted weather order so dataset
-        # indexing is deterministic w.r.t. OS file ordering.
+        if val_samples_per_weather is not None and val_samples_per_weather > 0:
+            for weather in list(samples_by_weather.keys()):
+                bucket = samples_by_weather[weather]
+                if len(bucket) > val_samples_per_weather:
+                    samples_by_weather[weather] = bucket[:val_samples_per_weather]
+
         self.samples: List[Tuple[str, str, str]] = []
         for weather in sorted(samples_by_weather):
             self.samples.extend(samples_by_weather[weather])
 
-        # Optional overall cap (legacy max_samples parameter, applied after
-        # the per-weather cap as a final global truncation).
         if max_samples is not None and max_samples > 0:
             self.samples = self.samples[:max_samples]
 
@@ -178,6 +168,8 @@ class WeatherRestorationDataset(Dataset):
         lq_img = Image.open(lq_path).convert("RGB")
         gt_img = Image.open(gt_path).convert("RGB")
 
+        orig_size = lq_img.size  # (W, H) before any transform
+
         for t in self.transforms:
             lq_img, gt_img = t(lq_img, gt_img)
 
@@ -186,6 +178,8 @@ class WeatherRestorationDataset(Dataset):
             "gt": gt_img,                  # float tensor, [-1, 1], CHW
             "weather": weather,            # str (e.g. "rain")
             "lq_path": lq_path,            # for debugging
+            "gt_path": gt_path,            # for original-size re-save
+            "orig_size": orig_size,        # (W, H) of the on-disk image
         }
 
     # ------------------------------------------------------------------ #
@@ -218,11 +212,12 @@ def _list_images(
 # Custom collate for variable-resolution batches
 # -----------------------------------------------------------------------------
 def _collate_var_resolution(batch: List[Dict]) -> Dict[str, object]:
-    """Collate a list of {"lq", "gt", "weather", "lq_path"} samples.
+    """Collate a list of {"lq", "gt", "weather", "lq_path", "gt_path", "orig_size"} samples.
 
     All samples are padded to the maximum H/W in the batch (right/bottom only)
-    so they form a single BCHW tensor.  The original shape is stored in
-    ``orig_size`` so downstream code can crop back if needed.
+    so they form a single BCHW tensor.  The original on-disk shape is preserved
+    in ``orig_size`` so downstream code (e.g. validation) can restore the
+    original resolution before saving.
     """
     lq_tensors = [item["lq"] for item in batch]
     gt_tensors = [item["gt"] for item in batch]
@@ -246,6 +241,8 @@ def _collate_var_resolution(batch: List[Dict]) -> Dict[str, object]:
         "gt": gt_padded,
         "weather": [item["weather"] for item in batch],
         "lq_path": [item["lq_path"] for item in batch],
+        "gt_path": [item["gt_path"] for item in batch],
+        "orig_size": [item["orig_size"] for item in batch],
     }
 
 
@@ -267,6 +264,7 @@ def create_dataloader(
     random_crop: bool = True,
     max_samples: Optional[int] = None,
     samples_per_weather: Optional[int] = None,
+    val_samples_per_weather: Optional[int] = None,
     pin_memory: bool = True,
     shuffle: Optional[bool] = None,
 ) -> DataLoader:
@@ -277,9 +275,10 @@ def create_dataloader(
     shuffle
         Defaults to ``True`` for the train split and ``False`` for test.
     samples_per_weather
-        Optional per-weather-class cap (e.g. 1000 keeps 1000 images per
-        ``rain`` / ``snow`` / ``haze`` bucket). Deterministic (first N by
-        sorted filename). ``None`` keeps everything per class.
+        Per-weather cap for training split.
+    val_samples_per_weather
+        Per-weather cap specifically for the validation split (takes priority
+        over ``samples_per_weather`` when set for the test split).
     """
     dataset = WeatherRestorationDataset(
         data_root=data_root,
@@ -294,6 +293,7 @@ def create_dataloader(
         random_crop=random_crop,
         max_samples=max_samples,
         samples_per_weather=samples_per_weather,
+        val_samples_per_weather=val_samples_per_weather,
     )
 
     if shuffle is None:

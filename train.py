@@ -78,22 +78,6 @@ def _resolve_dtype(mp: str) -> torch.dtype:
     return {"no": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(mp, torch.float32)
 
 
-def _save_image_grid(images: torch.Tensor, ncols: int, path: str) -> None:
-    """Save a batch of ``[-1, 1]`` images as a single grid PNG."""
-    imgs = (images.clamp(-1, 1) + 1) / 2
-    imgs = (imgs * 255).to(torch.uint8).cpu().permute(0, 2, 3, 1).numpy()
-    pil = [Image.fromarray(im) for im in imgs]
-    if len(pil) == 0:
-        return
-    w, h = pil[0].size
-    rows = math.ceil(len(pil) / ncols)
-    grid = Image.new("RGB", (w * ncols, h * rows), color=(0, 0, 0))
-    for i, im in enumerate(pil):
-        r, c = divmod(i, ncols)
-        grid.paste(im, (c * w, r * h))
-    grid.save(path)
-
-
 def _fmt_eta(seconds: float) -> str:
     """Format seconds into a compact ``Hh Mm Ss`` string."""
     seconds = max(0, int(seconds))
@@ -116,8 +100,11 @@ def _latest_checkpoint(output_dir: str) -> Optional[str]:
 def _prune_checkpoints(output_dir: str, keep: int) -> None:
     if keep <= 0:
         return
+    weights_dir = os.path.join(output_dir, "weights")
+    if not os.path.isdir(weights_dir):
+        return
     ckpts = sorted(
-        glob(os.path.join(output_dir, "checkpoint-*")),
+        glob(os.path.join(weights_dir, "checkpoint-*")),
         key=lambda p: int(p.split("-")[-1]),
     )
     for old in ckpts[:-keep]:
@@ -181,7 +168,7 @@ class Trainer:
             data_root=self.dataset_cfg["data_root"],
             split=self.dataset_cfg["test_subdir"],
             image_size=self.dataset_cfg["image_size"],
-            batch_size=self.train_cfg["num_validation_images"],
+            batch_size=1,
             num_workers=self.dataset_cfg["num_workers"],
             image_extensions=self.dataset_cfg["image_extensions"],
             lq_subdir=self.dataset_cfg["lq_subdir"],
@@ -190,9 +177,8 @@ class Trainer:
             test_subdir=self.dataset_cfg["test_subdir"],
             random_flip=False,
             random_crop=False,
-            max_samples=self.dataset_cfg.get("test_max_samples"),
             samples_per_weather=self.dataset_cfg.get("samples_per_weather"),
-            shuffle=False,
+            val_samples_per_weather=self.train_cfg.get("num_validation_images"),
             pin_memory=self.train_cfg["dataloader_pin_memory"],
         )
         logger.info(
@@ -432,7 +418,6 @@ class Trainer:
 
             for batch in self.train_loader:
                 t0 = time.time()
-                # Build prepared batch (encodes latents, prompts, etc.).
                 prepared = self.model.prepare_batch(
                     clean_pixel_values=batch["gt"],
                     degraded_pixel_values=batch["lq"],
@@ -526,13 +511,9 @@ class Trainer:
                         step=step + 1,
                     )
 
-                # Periodic validation.
-                if (step + 1) % val_every == 0:
-                    self.validate(step + 1)
-
-                # Periodic checkpoint (step-based).
-                if (step + 1) % ckpt_every == 0:
-                    self.save_checkpoint(step + 1)
+                # Periodic validation / step-based checkpoint removed.
+                # Validation and checkpoint saving are now driven by
+                # ``checkpointing_epochs`` and run once per epoch (see below).
 
                 step += 1
                 pbar.update(1)
@@ -555,7 +536,7 @@ class Trainer:
             # optionally use them.
             # ------------------------------------------------------------------
             try:
-                val_metrics = self.validate(step, return_metrics=True) or {}
+                val_metrics = self.validate(step, return_metrics=True, epoch=epoch) or {}
             except Exception as e:
                 logger.warning("End-of-epoch validation failed: %s", e)
                 val_metrics = {}
@@ -605,7 +586,7 @@ class Trainer:
             if save_now:
                 pbar.write(f"Saving epoch checkpoint at epoch={epoch} ...")
                 try:
-                    self.save_checkpoint(step, tag=f"epoch-{epoch:03d}")
+                    self.save_checkpoint(step, epoch=epoch)
                 except Exception as e:
                     logger.warning("Epoch checkpoint failed: %s", e)
 
@@ -625,10 +606,10 @@ class Trainer:
 
         # Final save + validation.
         try:
-            self.save_checkpoint(step, tag="final")
+            self.save_checkpoint(step, tag="final", epoch=999)
         except Exception as e:
             logger.warning("Final checkpoint failed: %s", e)
-        final_metrics = self.validate(step, return_metrics=True) or {}
+        final_metrics = self.validate(step, return_metrics=True, epoch=999) or {}
         logger.info(
             "Training finished: %d steps in %s | best %s = %s @ step %s "
             "| final_psnr=%s | final_ssim=%s",
@@ -669,68 +650,32 @@ class Trainer:
     # Validation: run ControlNet sampling on val samples, save image grids.
     # ------------------------------------------------------------------ #
     @torch.no_grad()
-    def validate(self, step: int, return_metrics: bool = True) -> Optional[Dict[str, float]]:
-        """Render validation grids + compute PSNR/SSIM over the full test set.
+    def validate(self, step: int, return_metrics: bool = True,
+                 epoch: int = 0) -> Optional[Dict[str, float]]:
+        """Run inference on the full validation set and compute PSNR/SSIM.
 
-        Returns
-        -------
-        dict with keys ``"psnr"`` and ``"ssim"`` (averaged over the entire
-        test loader), or ``None`` when ``return_metrics=False``.
-        """
-        n_samples = self.train_cfg["num_validation_images"]
-        out_dir = os.path.join(self.output_dir, "validation")
-        path, metrics = self._render_test_grid(
-            tag=f"step-{step:06d}",
-            n_images=n_samples,
-            out_dir=out_dir,
-            compute_metrics=True,
-        )
-        if metrics:
-            logger.info(
-                "Validation @ step=%d | PSNR=%.3f dB | SSIM=%.4f | grid=%s",
-                step, metrics["psnr"], metrics["ssim"], path or "(none)",
-            )
-            self._log(
-                {
-                    "val/psnr": metrics["psnr"],
-                    "val/ssim": metrics["ssim"],
-                },
-                step=step,
-            )
-        self.model.controlnet.train()
-        return metrics if return_metrics else None
-
-    @torch.no_grad()
-    def _render_test_grid(
-        self,
-        tag: str,
-        n_images: int,
-        out_dir: str,
-        compute_metrics: bool = False,
-    ) -> Tuple[str, Optional[Dict[str, float]]]:
-        """Run inference on the first ``n_images`` test samples and write a
-        3-row ``LQ / GT / restored`` PNG.
-
-        When ``compute_metrics=True``, PSNR/SSIM are also computed across
-        the **entire** test loader (not just the first ``n_images``).
-        Returns ``(png_path, metrics_dict_or_None)``.
+        Images are saved as individual files organised by weather category:
+            validation/epoch-{epoch:03d}/{weather}/{LQ,GT,PRED}_{index:04d}.png
         """
         self.model.controlnet.eval()
-        os.makedirs(out_dir, exist_ok=True)
+
+        val_out_dir = os.path.join(self.output_dir, "validation", f"epoch-{epoch:03d}")
 
         iq_cfg = self.train_cfg.get("image_quality", {})
         meter = ImageQualityMeter(
             data_range=float(iq_cfg.get("data_range", 1.0)),
             use_torchmetrics=(iq_cfg.get("backend", "torchmetrics") == "torchmetrics"),
+            device=self.device,
         )
-        saved = 0
-        written_path = ""
-        n_total = 0
 
+        n_total = 0
         for batch in self.val_loader:
             lq = batch["lq"].to(self.device, dtype=self.dtype)
             gt = batch["gt"].to(self.device, dtype=self.dtype)
             weather = list(batch["weather"])
+            lq_paths = batch["lq_path"]
+            gt_paths = batch["gt_path"]
+            orig_sizes = batch["orig_size"]
 
             tile_size = self.cfg["infer"].get("tile_size", 0)
             tile_stride = self.cfg["infer"].get("tile_stride", 0)
@@ -756,89 +701,86 @@ class Trainer:
                     num_inference_steps=self.train_cfg["num_inference_steps"],
                 )
 
-            # Accumulate PSNR/SSIM over the full test set.
-            if compute_metrics:
-                pred_01 = ((preds + 1) / 2).clamp(0.0, 1.0)
-                gt_01 = ((gt + 1) / 2).clamp(0.0, 1.0)
-                meter.update(pred_01, gt_01)
+            # Metrics on full validation set (computed at the resized resolution)
+            pred_01 = ((preds + 1) / 2).clamp(0.0, 1.0)
+            gt_01 = ((gt + 1) / 2).clamp(0.0, 1.0)
+            meter.update(pred_01, gt_01)
 
-            # Save the first ``n_images`` samples as a 3-row grid.
-            if saved < n_images:
-                lq_vis = (lq + 1) / 2
-                gt_vis = (gt + 1) / 2
-                pred_vis = (preds + 1) / 2
-                stacked = torch.cat([lq_vis, gt_vis, pred_vis], dim=0)
+            # Save individual images per weather at the original on-disk resolution
+            for i, (w, lq_path, gt_path, orig_size) in enumerate(
+                zip(weather, lq_paths, gt_paths, orig_sizes)
+            ):
+                w_dir = os.path.join(val_out_dir, w)
+                os.makedirs(w_dir, exist_ok=True)
+                stem = os.path.splitext(os.path.basename(lq_path))[0]
+                orig_w, orig_h = orig_size
 
-                path = os.path.join(out_dir, f"{tag}.png")
-                _save_image_grid(stacked, ncols=lq.shape[0], path=path)
-                saved += lq.shape[0]
-                if not written_path:
-                    written_path = path
+                # LQ/GT: re-read from disk at the original size (true original resolution)
+                lq_orig = Image.open(lq_path).convert("RGB")
+                gt_orig = Image.open(gt_path).convert("RGB")
+
+                # PRED: bicubic-resize from the inference resolution up to original
+                pred_i = preds[i:i + 1].clamp(-1, 1)
+                pred_i = F.interpolate(
+                    pred_i, size=(orig_h, orig_w), mode="bicubic", align_corners=False,
+                )[0]
+                pred_np = ((pred_i + 1) / 2).clamp(0.0, 1.0)
+                pred_np = (pred_np.permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
+                pred_img = Image.fromarray(pred_np)
+
+                lq_orig.save(os.path.join(w_dir, f"LQ_{stem}.png"))
+                gt_orig.save(os.path.join(w_dir, f"GT_{stem}.png"))
+                pred_img.save(os.path.join(w_dir, f"PRED_{stem}.png"))
 
             n_total += lq.shape[0]
 
-        metrics = meter.compute() if compute_metrics else None
-        if compute_metrics and metrics is not None:
-            metrics["n_samples"] = int(n_total)
-        return written_path, metrics
+        metrics = meter.compute()
+        logger.info(
+            "Validation @ step=%d | PSNR=%.3f dB | SSIM=%.4f | %d samples",
+            step, metrics["psnr"], metrics["ssim"], n_total,
+        )
+        self._log(
+            {"val/psnr": metrics["psnr"], "val/ssim": metrics["ssim"]},
+            step=step,
+        )
+
+        self.model.controlnet.train()
+        return metrics if return_metrics else None
 
     # ------------------------------------------------------------------ #
     # Saving
     # ------------------------------------------------------------------ #
     def save_checkpoint(self, step: int, tag: Optional[str] = None,
-                        is_best: bool = False) -> str:
-        """Persist ControlNet + optimiser + scheduler to ``checkpoint-<step>``.
-
-        Also renders a visual preview grid (LQ / GT / restored) so the
-        operator can sanity-check restoration quality over time.
+                        is_best: bool = False, epoch: int = 0) -> str:
+        """Persist ControlNet + optimiser + scheduler to ``weights/checkpoint-<epoch>``.
 
         Parameters
         ----------
         step
-            Optimizer step counter (used for naming + pruning).
+            Optimizer step counter (used for pruning only).
         tag
-            Optional explicit tag used for the preview filename; defaults
-            to ``"step-<step:06d>"``.  Pass ``"best"`` when saving the
-            best-so-far model.
+            Optional explicit tag for the directory name.
         is_best
-            When true, also write the same payload to ``<output>/best/``
+            When true, also write the same payload to ``weights/best/``
             (overwriting any previous best).
+        epoch
+            Epoch number (used for naming).
         """
         if tag is None:
-            tag = f"step-{step:06d}"
+            tag = f"epoch-{epoch:03d}"
 
-        ckpt_dir = os.path.join(self.output_dir, f"checkpoint-{step}")
+        ckpt_dir = os.path.join(self.output_dir, "weights", f"checkpoint-{epoch}")
         os.makedirs(ckpt_dir, exist_ok=True)
         self.model.save_controlnet(ckpt_dir)
         torch.save(self.optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
         torch.save(self.lr_scheduler.state_dict(), os.path.join(ckpt_dir, "scheduler.pt"))
 
-        # Log what was written so the operator knows the exact files.
         written = sorted(os.listdir(ckpt_dir))
-        logger.info("Saved checkpoint to %s (files: %s)",
-                    ckpt_dir, ", ".join(written))
+        logger.info("Saved checkpoint to %s (files: %s)", ckpt_dir, ", ".join(written))
 
-        # Visual preview: LQ / GT / restored on the first N test images.
-        try:
-            preview_dir = os.path.join(self.output_dir, "preview")
-            preview_path = self._render_test_grid(
-                tag=f"step-{step:06d}",
-                n_images=self.train_cfg.get("num_preview_images", 4),
-                out_dir=preview_dir,
-            )
-            if preview_path:
-                logger.info("Saved preview grid -> %s", preview_path)
-        except Exception as e:
-            logger.warning("Preview rendering failed: %s", e)
-        finally:
-            self.model.controlnet.train()
-
-        # Mirror to <output>/best/ if requested.
         if is_best:
-            best_dir = os.path.join(self.output_dir, "best")
+            best_dir = os.path.join(self.output_dir, "weights", "best")
             os.makedirs(best_dir, exist_ok=True)
-            # Remove stale contents so the best/ folder is always a single
-            # snapshot of the latest "best" weights.
             for entry in os.listdir(best_dir):
                 full = os.path.join(best_dir, entry)
                 if os.path.isdir(full):
@@ -851,19 +793,7 @@ class Trainer:
             self.model.save_controlnet(best_dir)
             torch.save(self.optimizer.state_dict(), os.path.join(best_dir, "optimizer.pt"))
             torch.save(self.lr_scheduler.state_dict(), os.path.join(best_dir, "scheduler.pt"))
-            # Save the matching preview into best/ for direct comparison.
-            try:
-                best_preview = self._render_test_grid(
-                    tag="best",
-                    n_images=self.train_cfg.get("num_preview_images", 4),
-                    out_dir=os.path.join(self.output_dir, "preview"),
-                )
-                if best_preview:
-                    logger.info("Saved best-preview grid -> %s", best_preview)
-            except Exception as e:
-                logger.warning("Best-preview rendering failed: %s", e)
-            finally:
-                self.model.controlnet.train()
+            logger.info("Saved best checkpoint to %s", best_dir)
 
         _prune_checkpoints(self.output_dir, self.train_cfg["checkpoints_total_limit"])
         return ckpt_dir

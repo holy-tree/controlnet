@@ -16,7 +16,7 @@ project:
   num_gpus: 1
   mixed_precision: "fp16"             # "no" | "fp16" | "bf16"
   enable_xformers: true
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   print_config_on_start: true
 
 # =============================================================================
@@ -59,13 +59,13 @@ dataset:
   lq_subdir:    "LQ"
   gt_subdir:    "GT"
   image_extensions: [".png", ".jpg", ".jpeg", ".bmp", ".webp"]
-  image_size: 256                   # short side; H/W rounded to nearest %8
+  image_size: 128                   # short side; H/W rounded to nearest %8
   random_flip: true
   random_crop: true
   normalize_range: "minus_one_one"
   num_workers: 8
   test_max_samples: 16
-  samples_per_weather: 500          # per-class cap; null = no limit
+  samples_per_weather: 8          # per-class cap; null = no limit
 
 # =============================================================================
 # Training
@@ -74,7 +74,7 @@ train:
   # --- Schedule ---
   num_train_epochs: 20
   max_train_steps: null              # overrides num_train_epochs if set
-  batch_size: 8
+  batch_size: 4
   gradient_accumulation_steps: 1
   # --- Optimiser ---
   learning_rate: 1.0e-5
@@ -134,6 +134,6 @@ infer:
   num_inference_steps: 30
   image_size: 512                    # short side upscale before inference
   # --- Tiled / variable-resolution inference (0 = disabled) ---
-  tile_size: 512
-  tile_stride: 384
-  tile_blend_sigma: 32.0
+  tile_size: 0
+  tile_stride: 0
+  tile_blend_sigma: 0.0

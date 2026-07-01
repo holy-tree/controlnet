@@ -38,6 +38,9 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
+import warnings
+warnings.filterwarnings("ignore", message=".*You have disabled the safety checker.*")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -368,50 +371,38 @@ class ControlNetRestorationModel:
         diffusion_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
         # ------------------------------------------------------------------
-        # Pixel-space recon: x0 = (x_t - sqrt(1-a_bar_t) * eps) / sqrt(a_bar_t),
-        # VAE-decode, then compare against the **clean GT pixels**.
-        # This time the gradient flows into the loss so it actually
-        # contributes to the training objective.
+        # Pixel-space recon: x0 -> VAE decode -> L1 vs clean GT.
+        # VAE decode is precision-sensitive; run in FP32 explicitly.
         # ------------------------------------------------------------------
         if prediction_type == "epsilon":
             alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(
-                device=batch.noisy_latents.device,
-                dtype=batch.noisy_latents.dtype,
+                device=batch.noisy_latents.device, dtype=torch.float32,
             )
             alpha_bar_t = alphas_cumprod[batch.timesteps].view(-1, 1, 1, 1)
             sqrt_alpha_bar = alpha_bar_t.sqrt()
             sqrt_one_minus = (1.0 - alpha_bar_t).sqrt()
-            pred_x0 = (batch.noisy_latents - sqrt_one_minus * model_pred) / sqrt_alpha_bar
+            pred_x0 = (batch.noisy_latents.float() - sqrt_one_minus * model_pred.float()) / sqrt_alpha_bar
         elif prediction_type == "v_prediction":
             if hasattr(self.noise_scheduler, "get_velocity_to_x0"):
                 pred_x0 = self.noise_scheduler.get_velocity_to_x0(
                     batch.noisy_latents, model_pred, batch.timesteps
                 )
             else:
-                # Fall back to using the model_pred directly if the
-                # scheduler doesn't expose the helper.
-                pred_x0 = model_pred
+                pred_x0 = model_pred.float()
         else:
-            pred_x0 = model_pred
+            pred_x0 = model_pred.float()
 
         pred_x0_scaled = pred_x0 / self.vae.config.scaling_factor
         recon = self.vae.decode(pred_x0_scaled.to(dtype=self.dtype)).sample.clamp(-1, 1)
-
-        # 4. Pixel loss (L1) — recon vs clean GT.
         pixel_loss = F.l1_loss(recon.float(), batch.clean_pixel_values)
 
-        # 5. LPIPS perceptual loss.
-        lpips_loss = torch.tensor(0.0, device=self.device)
+        lpips_loss = torch.tensor(0.0, device=self.device, dtype=torch.float32)
         if self._lpips_loss_weight > 0.0:
             try:
-                lpips_val = self._get_lpips()(
-                    recon.float(), batch.clean_pixel_values.float()
-                ).mean()
-                lpips_loss = lpips_val
+                lpips_loss = self._get_lpips()(recon, batch.clean_pixel_values.float()).mean()
             except Exception as e:
                 logger.debug("LPIPS forward failed; treating loss as zero. %s", e)
 
-        # 6. Combined objective.
         total_loss = (
             diffusion_loss
             + self._pixel_loss_weight * pixel_loss
@@ -480,11 +471,6 @@ class ControlNetRestorationModel:
             enabled=(self.dtype != torch.float32),
             dtype=self.dtype,
         ):
-            # ``negative_prompt=None`` lets diffusers use its built-in
-            # classifier-free-guidance unconditional branch (empty string).
-            # Passing the weather-conditioned prompt again as negative
-            # would bias the restoration away from the very semantics we
-            # just injected — not what we want for restoration.
             out = pipe(
                 prompt=wp.prompts,
                 negative_prompt=None,
@@ -641,20 +627,22 @@ class ControlNetRestorationModel:
                 tile = degraded_pixel_values[:, :, y:y+tile_size, x:x+tile_size]
                 pil_tile = self._tensor_to_pil(tile)
 
-                with torch.amp.autocast(
-                    device_type="cuda" if self.device.type == "cuda" else "cpu",
-                    enabled=(self.dtype != torch.float32),
-                    dtype=self.dtype,
-                ):
-                    out_tile = pipe(
-                        prompt=wp.prompts,
-                        negative_prompt=None,
-                        image=pil_tile,
-                        num_inference_steps=num_inference_steps,
-                        guidance_scale=guidance_scale,
-                        generator=generator,
-                        output_type="pt",
-                    ).images
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*safety.*checker.*")
+                    with torch.amp.autocast(
+                        device_type="cuda" if self.device.type == "cuda" else "cpu",
+                        enabled=(self.dtype != torch.float32),
+                        dtype=self.dtype,
+                    ):
+                        out_tile = pipe(
+                            prompt=wp.prompts,
+                            negative_prompt=None,
+                            image=pil_tile,
+                            num_inference_steps=num_inference_steps,
+                            guidance_scale=guidance_scale,
+                            generator=generator,
+                            output_type="pt",
+                        ).images
 
                 out_tile = out_tile.to(device=self.device, dtype=self.dtype)
                 output_accum[:, :, y:y+tile_size, x:x+tile_size] += out_tile * weight_map

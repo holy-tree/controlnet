@@ -47,6 +47,6 @@ infer:
   guidance_scale: 2.5
   num_inference_steps: 20
   image_size: 512                    # short side upscale before inference
-  tile_size: 512
-  tile_stride: 384
-  tile_blend_sigma: 32.0
+  tile_size: 0                      # 0 = disabled, use regular sample
+  tile_stride: 0
+  tile_blend_sigma: 0.0

@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="3b8ccc7b-4728-4420-9ce4-9c35df66c024" name="更改" comment="[fix] infer.yaml">
+    <list default="true" id="3b8ccc7b-4728-4420-9ce4-9c35df66c024" name="更改" comment="[fix] 整理了一下yaml文件，并且对resize的逻辑修改为等比例缩放">
       <change beforePath="$PROJECT_DIR$/config/config.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/config/config.yaml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/config/infer.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/config/infer.yaml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/datasets/transforms.py" beforeDir="false" afterPath="$PROJECT_DIR$/datasets/transforms.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/datasets/weather_restoration.py" beforeDir="false" afterPath="$PROJECT_DIR$/datasets/weather_restoration.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/models/controlnet_wrapper.py" beforeDir="false" afterPath="$PROJECT_DIR$/models/controlnet_wrapper.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/train.py" beforeDir="false" afterPath="$PROJECT_DIR$/train.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/metrics.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/metrics.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -75,7 +75,7 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1782799861912</updated>
-      <workItem from="1782799862945" duration="28421000" />
+      <workItem from="1782799862945" duration="48141000" />
     </task>
     <task id="LOCAL-00001" summary="[feat] sd2 controlnet 训练框架">
       <option name="closed" value="true" />
@@ -117,7 +117,23 @@
       <option name="project" value="LOCAL" />
       <updated>1782836428541</updated>
     </task>
-    <option name="localTasksCounter" value="6" />
+    <task id="LOCAL-00006" summary="[fix] 整理了一下yaml文件，并且对resize的逻辑修改为等比例缩放">
+      <option name="closed" value="true" />
+      <created>1782870420223</created>
+      <option name="number" value="00006" />
+      <option name="presentableId" value="LOCAL-00006" />
+      <option name="project" value="LOCAL" />
+      <updated>1782870420223</updated>
+    </task>
+    <task id="LOCAL-00007" summary="[fix] 整理了一下yaml文件，并且对resize的逻辑修改为等比例缩放">
+      <option name="closed" value="true" />
+      <created>1782870743745</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1782870743745</updated>
+    </task>
+    <option name="localTasksCounter" value="8" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -138,6 +154,7 @@
     <MESSAGE value="[feat] sd2 controlnet 训练框架" />
     <MESSAGE value="[fix] 修改模型内部逻辑" />
     <MESSAGE value="[fix] infer.yaml" />
-    <option name="LAST_COMMIT_MESSAGE" value="[fix] infer.yaml" />
+    <MESSAGE value="[fix] 整理了一下yaml文件，并且对resize的逻辑修改为等比例缩放" />
+    <option name="LAST_COMMIT_MESSAGE" value="[fix] 整理了一下yaml文件，并且对resize的逻辑修改为等比例缩放" />
   </component>
 </project>

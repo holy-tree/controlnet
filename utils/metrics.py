@@ -96,12 +96,16 @@ class ImageQualityMeter:
     ``(B, 3, H, W)``.
     """
 
-    def __init__(self, data_range: float = 1.0, use_torchmetrics: bool = True):
+    def __init__(self, data_range: float = 1.0, use_torchmetrics: bool = True,
+                 device: torch.device = None):
         self.data_range = float(data_range)
         self._use_torchmetrics = bool(use_torchmetrics and _HAS_TORCHMETRICS)
         if self._use_torchmetrics:
             self._psnr = PeakSignalNoiseRatio(data_range=self.data_range)
             self._ssim = StructuralSimilarityIndexMeasure(data_range=self.data_range)
+            if device is not None:
+                self._psnr = self._psnr.to(device)
+                self._ssim = self._ssim.to(device)
 
     # ------------------------------------------------------------------ #
     # Backend helpers
